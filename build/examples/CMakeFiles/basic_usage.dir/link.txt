@@ -1,1 +1,0 @@
-/usr/sbin/c++  -Wall -Wextra -O2 -g -Wl,--dependency-file=CMakeFiles/basic_usage.dir/link.d CMakeFiles/basic_usage.dir/basic_usage.cc.o -o basic_usage  ../src/liblrdb.a

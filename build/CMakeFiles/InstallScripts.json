@@ -1,9 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/lk/git/Project/g-LRDB/build/cmake_install.cmake",
-		"/home/lk/git/Project/g-LRDB/build/src/cmake_install.cmake",
-		"/home/lk/git/Project/g-LRDB/build/examples/cmake_install.cmake"
-	],
-	"Parallel" : false
-}
