@@ -15,6 +15,15 @@ namespace lrdb {
 // 前向声明
 class Comparator;
 
+// 将键转换为Slice：string键直接引用内容，其他类型按二进制内容比较
+template <typename KeyT> inline Slice MakeSlice(const KeyT &key) {
+  if constexpr (std::is_same_v<KeyT, std::string>) {
+    return Slice(key);
+  } else {
+    return Slice(reinterpret_cast<const char *>(&key), sizeof(KeyT));
+  }
+}
+
 // Skiplist模板类
 template <typename Key, typename Value> class SkipList {
 public:
@@ -228,20 +237,12 @@ SkipList<Key, Value>::FindGreaterOrEqual(const Key &key, Node **prev) const {
     Node *next = x->Next(level);
 
     if (next != nullptr) {
-      // 对于std::string类型，直接比较字符串内容
-      if constexpr (std::is_same_v<Key, std::string>) {
-        if (next->key < key) {
-          x = next;
-          continue;
-        }
-      } else {
-        // 对于其他类型，使用Slice比较
-        if (comparator_->Compare(
-                Slice(reinterpret_cast<const char *>(&next->key), sizeof(Key)),
-                Slice(reinterpret_cast<const char *>(&key), sizeof(Key))) < 0) {
-          x = next;
-          continue;
-        }
+      // 统一使用比较器排序：string键（如MemTable的内部键）必须走
+      // InternalKeyComparator，字典序会破坏"同用户键新版本在前"的顺序
+      int cmp = comparator_->Compare(MakeSlice(next->key), MakeSlice(key));
+      if (cmp < 0) {
+        x = next;
+        continue;
       }
     }
 
@@ -275,20 +276,10 @@ SkipList<Key, Value>::FindLessThan(const Key &key) const {
     } else {
       bool should_continue = false;
 
-      // 对于std::string类型，直接比较字符串内容
-      if constexpr (std::is_same_v<Key, std::string>) {
-        if (next->key < key) {
-          x = next;
-          should_continue = true;
-        }
-      } else {
-        // 对于其他类型，使用Slice比较
-        if (comparator_->Compare(
-                Slice(reinterpret_cast<const char *>(&next->key), sizeof(Key)),
-                Slice(reinterpret_cast<const char *>(&key), sizeof(Key))) < 0) {
-          x = next;
-          should_continue = true;
-        }
+      // 统一使用比较器排序（内部键必须按InternalKeyComparator排序）
+      if (comparator_->Compare(MakeSlice(next->key), MakeSlice(key)) < 0) {
+        x = next;
+        should_continue = true;
       }
 
       if (should_continue) {
@@ -334,16 +325,8 @@ void SkipList<Key, Value>::Insert(const Key &key, const Value &value) {
   if (x != nullptr) {
     bool key_exists = false;
 
-    // 对于std::string类型，直接比较字符串内容
-    if constexpr (std::is_same_v<Key, std::string>) {
-      key_exists = (x->key == key);
-    } else {
-      // 对于其他类型，使用Slice比较
-      key_exists =
-          (comparator_->Compare(
-               Slice(reinterpret_cast<const char *>(&x->key), sizeof(Key)),
-               Slice(reinterpret_cast<const char *>(&key), sizeof(Key))) == 0);
-    }
+    // 统一使用比较器判断键相等
+    key_exists = (comparator_->Compare(MakeSlice(x->key), MakeSlice(key)) == 0);
 
     if (key_exists) {
       x->value = value;
@@ -379,15 +362,8 @@ void SkipList<Key, Value>::Merge(const Key &key, const Value &value) {
   bool key_exists = false;
 
   if (x != nullptr) {
-    // 判断 key 是否相等
-    if constexpr (std::is_same_v<Key, std::string>) {
-      key_exists = (x->key == key);
-    } else {
-      key_exists =
-          (comparator_->Compare(
-               Slice(reinterpret_cast<const char *>(&x->key), sizeof(Key)),
-               Slice(reinterpret_cast<const char *>(&key), sizeof(Key))) == 0);
-    }
+    // 统一使用比较器判断键相等
+    key_exists = (comparator_->Compare(MakeSlice(x->key), MakeSlice(key)) == 0);
   }
 
   if (key_exists) {
@@ -437,16 +413,8 @@ bool SkipList<Key, Value>::Delete(const Key &key) {
 
   bool key_exists = false;
 
-  // 对于std::string类型，直接比较字符串内容
-  if constexpr (std::is_same_v<Key, std::string>) {
-    key_exists = (x->key == key);
-  } else {
-    // 对于其他类型，使用Slice比较
-    key_exists =
-        (comparator_->Compare(
-             Slice(reinterpret_cast<const char *>(&x->key), sizeof(Key)),
-             Slice(reinterpret_cast<const char *>(&key), sizeof(Key))) == 0);
-  }
+  // 统一使用比较器判断键相等
+  key_exists = (comparator_->Compare(MakeSlice(x->key), MakeSlice(key)) == 0);
 
   if (!key_exists) {
     return false;
@@ -484,15 +452,8 @@ bool SkipList<Key, Value>::Contains(const Key &key) const {
     return false;
   }
 
-  // 对于std::string类型，直接比较字符串内容
-  if constexpr (std::is_same_v<Key, std::string>) {
-    return (x->key == key);
-  } else {
-    // 对于其他类型，使用Slice比较
-    return (comparator_->Compare(
-                Slice(reinterpret_cast<const char *>(&x->key), sizeof(Key)),
-                Slice(reinterpret_cast<const char *>(&key), sizeof(Key))) == 0);
-  }
+  // 统一使用比较器判断键相等
+  return (comparator_->Compare(MakeSlice(x->key), MakeSlice(key)) == 0);
 }
 
 template <typename Key, typename Value>
@@ -506,16 +467,8 @@ bool SkipList<Key, Value>::Get(const Key &key, Value *value) const {
 
   bool key_exists = false;
 
-  // 对于std::string类型，直接比较字符串内容
-  if constexpr (std::is_same_v<Key, std::string>) {
-    key_exists = (x->key == key);
-  } else {
-    // 对于其他类型，使用Slice比较
-    key_exists =
-        (comparator_->Compare(
-             Slice(reinterpret_cast<const char *>(&x->key), sizeof(Key)),
-             Slice(reinterpret_cast<const char *>(&key), sizeof(Key))) == 0);
-  }
+  // 统一使用比较器判断键相等
+  key_exists = (comparator_->Compare(MakeSlice(x->key), MakeSlice(key)) == 0);
 
   if (key_exists) {
     if (value) {
@@ -561,20 +514,10 @@ void SkipList<Key, Value>::RangeQuery(const Key &start, const Key &end,
   while (current != nullptr) {
     bool should_continue = false;
 
-    // 对于std::string类型，直接比较字符串内容
-    if constexpr (std::is_same_v<Key, std::string>) {
-      if (current->key <= end) {
-        callback(current->key, current->value);
-        should_continue = true;
-      }
-    } else {
-      // 对于其他类型，使用Slice比较
-      if (comparator_->Compare(
-              Slice(reinterpret_cast<const char *>(&current->key), sizeof(Key)),
-              Slice(reinterpret_cast<const char *>(&end), sizeof(Key))) <= 0) {
-        callback(current->key, current->value);
-        should_continue = true;
-      }
+    // 统一使用比较器判断范围
+    if (comparator_->Compare(MakeSlice(current->key), MakeSlice(end)) <= 0) {
+      callback(current->key, current->value);
+      should_continue = true;
     }
 
     if (!should_continue) {

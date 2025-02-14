@@ -131,11 +131,14 @@ bool GetVarint64(Slice* input, uint64_t* value) {
     const char* q = p;
     uint64_t result = 0;
     for (uint32_t shift = 0; shift <= 63 && q < limit; shift += 7) {
-        uint64_t byte = static_cast<uint64_t>(*q);
+        uint64_t byte = static_cast<uint8_t>(*q);
         q++;
         if (byte & 0x80) {
+            // 第10个字节（shift=63）时不允许再有续位，否则超出64位范围
+            if (shift >= 63) {
+                return false;
+            }
             result |= ((byte & 0x7f) << shift);
-            if (shift >= 56) break;
         } else {
             result |= (byte << shift);
             *value = result;
