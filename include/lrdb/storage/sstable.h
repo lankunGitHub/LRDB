@@ -321,6 +321,14 @@ private:
   uint64_t current_offset_;
   std::string last_key_;
 
+  // 各块的偏移与大小（写入Footer用）
+  uint64_t index_block_offset_{0};
+  uint32_t index_block_size_{0};
+  uint64_t bloom_block_offset_{0};
+  uint32_t bloom_block_size_{0};
+  uint64_t meta_block_offset_{0};
+  uint32_t meta_block_size_{0};
+
   // 统计信息
   WriteStats write_stats_;
 
@@ -484,6 +492,7 @@ struct SSTableManagerOptions {
   size_t table_cache_size = 256 * 1024 * 1024; // 256MB表缓存
   bool enable_file_prefetch = true;            // 启用文件预取
   size_t prefetch_size = 256 * 1024;           // 256KB预取大小
+  std::string directory;                       // SSTable文件所在目录（为空则使用当前目录）
 };
 
 class SSTableManager {
@@ -495,6 +504,11 @@ public:
 
   // 注册SSTable文件
   Status RegisterSSTable(const SSTableMeta &meta);
+
+  // 设置下一个文件编号（打开数据库加载已有文件后调用，避免重名）
+  void SetNextFileNumber(uint64_t file_number) {
+    next_file_number_.store(file_number);
+  }
 
   // 移除SSTable文件
   Status UnregisterSSTable(uint64_t file_number);

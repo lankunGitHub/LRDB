@@ -108,11 +108,12 @@ bool SSTableMeta::Decode(const Slice &data) {
   }
   filename = filename_slice.ToString();
 
-  uint32_t level_value;
-  if (!coding::GetVarint32(&input, &level_value)) {
+  // level使用定长4字节编码，与Encode保持一致
+  if (input.size() < 4) {
     return false;
   }
-  level = static_cast<SSTableLevel>(level_value);
+  level = static_cast<SSTableLevel>(coding::DecodeFixed32(input));
+  input.remove_prefix(4);
 
   // 键范围
   Slice smallest_slice, largest_slice;
@@ -222,11 +223,18 @@ bool IndexEntry::Decode(const Slice &data) {
 
   Slice key_slice;
   if (!coding::GetLengthPrefixedSlice(&input, &key_slice) ||
-      !coding::GetVarint64(&input, &block_offset) ||
-      !coding::GetVarint32(&input, &block_size) ||
-      !coding::GetVarint32(&input, &first_key_offset)) {
+      !coding::GetVarint64(&input, &block_offset)) {
     return false;
   }
+
+  // block_size和first_key_offset使用定长4字节编码，与Encode保持一致
+  if (input.size() < 8) {
+    return false;
+  }
+  block_size = coding::DecodeFixed32(input);
+  input.remove_prefix(4);
+  first_key_offset = coding::DecodeFixed32(input);
+  input.remove_prefix(4);
 
   key = key_slice.ToString();
   return true;
@@ -636,9 +644,13 @@ Status SSTableReader::Get(const Slice &key, std::string *value, bool *found,
   Status s = ReadDataBlock(entry.block_offset, entry.block_size, &block_data);
   RETURN_IF_ERROR(s);
 
-  // 在块内查找键，利用InternalKey的顺序特性
-  // InternalKey按：用户键（升序）-> 序列号（降序）-> 类型 排序
+  // 在块内查找键。同一用户键可能存在多个版本，取对快照可见的最大序列号版本。
   Slice input(block_data);
+  bool best_found = false;
+  uint64_t best_sequence = 0;
+  std::string best_value;
+  bool best_is_delete = false;
+
   while (!input.empty()) {
     // 解析存储的InternalKey
     Slice stored_internal_key;
@@ -669,30 +681,29 @@ Status SSTableReader::Get(const Slice &key, std::string *value, bool *found,
     // 比较用户键
     int cmp = comparator_->Compare(user_key, key);
     if (cmp == 0) {
-      // 找到匹配的用户键，检查快照可见性
-      if (snapshot == 0 || sequence <= snapshot) {
-        // 该版本对快照可见，这是我们要的结果
-        if (type == static_cast<uint8_t>(ValueType::kValue)) {
-          *found = true;
-          if (value) {
-            *value = stored_value.ToString();
-          }
-        } else if (type == static_cast<uint8_t>(ValueType::kDeletion)) {
-          *found = false; // 删除标记
-        } else if (type == static_cast<uint8_t>(ValueType::kMerge)) {
-          *found = true;
-          if (value) {
-            *value = stored_value.ToString();
-          }
-        }
-        return Status::OK();
+      // 匹配的用户键：只记录对快照可见且序列号最大的版本
+      if ((snapshot == 0 || sequence <= snapshot) && sequence >= best_sequence) {
+        best_found = true;
+        best_sequence = sequence;
+        best_is_delete = (type == static_cast<uint8_t>(ValueType::kDeletion));
+        best_value = stored_value.ToString();
       }
-      // 序列号太大，继续查找更老的版本
     } else if (cmp > 0) {
-      // 已经超过目标键，没有找到
+      // 已经超过目标键，没有找到更多版本
       break;
     }
     // cmp < 0，继续查找
+  }
+
+  if (best_found) {
+    if (best_is_delete) {
+      *found = false; // 最新可见版本是删除标记
+    } else {
+      *found = true;
+      if (value) {
+        *value = best_value;
+      }
+    }
   }
 
   return Status::OK();
@@ -1030,33 +1041,18 @@ Status SSTableReader::ReadIndex() {
   index_.clear();
   Slice input = index_content;
 
+  // 索引块格式：每个索引项先以长度前缀编码，再是条目本体
   while (!input.empty()) {
-    IndexEntry entry;
-    size_t consumed = 0;
-
-    // 保存原始输入以计算消耗的字节数
-    Slice original_input = input;
-
-    // 解析单个索引项
-    if (!entry.Decode(input)) {
-      // 如果解析失败，可能是到达了索引块末尾的填充区域
+    Slice entry_data;
+    if (!coding::GetLengthPrefixedSlice(&input, &entry_data)) {
+      // 解析失败，可能是块末尾的填充区域
       break;
     }
 
-    // 计算消耗的字节数
-    // IndexEntry格式：[key_length][key_data][block_offset][block_size][first_key_offset]
-    Slice temp_input = original_input;
-    Slice key_slice;
-    uint64_t dummy_offset;
-    uint32_t dummy_size, dummy_first_key_offset;
-
-    if (!coding::GetLengthPrefixedSlice(&temp_input, &key_slice) ||
-        !coding::GetVarint64(&temp_input, &dummy_offset) ||
-        !coding::GetVarint32(&temp_input, &dummy_size) ||
-        !coding::GetVarint32(&temp_input, &dummy_first_key_offset)) {
-      return Status::Corruption("Failed to calculate index entry size");
+    IndexEntry entry;
+    if (!entry.Decode(entry_data)) {
+      break;
     }
-    consumed = original_input.size() - temp_input.size();
 
     // 验证索引项的有效性
     if (entry.block_offset + entry.block_size > meta_.file_size) {
@@ -1073,9 +1069,6 @@ Status SSTableReader::ReadIndex() {
     }
 
     index_.push_back(std::move(entry));
-
-    // 移动输入指针
-    input.remove_prefix(consumed);
   }
 
   // 5. 验证至少有一个索引项
@@ -1084,15 +1077,27 @@ Status SSTableReader::ReadIndex() {
   }
 
   // 6. 验证索引覆盖范围与文件元数据一致
+  // 注意：索引键是内部键（用户键+8字节后缀），元数据里存的是用户键
   if (!index_.empty()) {
+    auto user_key_part = [](const std::string &internal_key) {
+      if (internal_key.size() < 8) {
+        return Slice(internal_key);
+      }
+      return Slice(internal_key.data(), internal_key.size() - 8);
+    };
+
     const std::string &first_key = index_.front().key;
     const std::string &last_key = index_.back().key;
 
     // 检查键范围是否与元数据一致
+    // 索引项记录的是各数据块的首键：首项必须等于最小键，
+    // 末项（最后一块的首键）必须不大于最大键
     if (!meta_.smallest_key.empty() && !meta_.largest_key.empty()) {
-      if (comparator_->Compare(Slice(first_key), Slice(meta_.smallest_key)) >
-              0 ||
-          comparator_->Compare(Slice(last_key), Slice(meta_.largest_key)) < 0) {
+      int cmp_first = comparator_->Compare(user_key_part(first_key),
+                                           Slice(meta_.smallest_key));
+      int cmp_last = comparator_->Compare(user_key_part(last_key),
+                                          Slice(meta_.largest_key));
+      if (cmp_first != 0 || cmp_last > 0) {
         return Status::Corruption(
             "Index key range inconsistent with meta data");
       }
@@ -1164,14 +1169,22 @@ Status SSTableReader::ReadDataBlock(uint64_t offset, uint32_t size,
     return Status::OK();
   }
 
-  result->resize(size);
+  // 索引项记录的是整个数据块（含块头）的范围，读取时跳过块头
+  if (size <= BlockHeader::kHeaderSize) {
+    return Status::Corruption("Data block too small");
+  }
+
+  const uint64_t data_offset = offset + BlockHeader::kHeaderSize;
+  const uint32_t data_size = size - BlockHeader::kHeaderSize;
+
+  result->resize(data_size);
   Slice data;
-  Status s = file_->Read(offset, size, &data, &(*result)[0]);
+  Status s = file_->Read(data_offset, data_size, &data, &(*result)[0]);
   if (!s.ok()) {
     return s;
   }
 
-  if (data.size() != size) {
+  if (data.size() != data_size) {
     return Status::IOError("Short read");
   }
 
@@ -1185,13 +1198,8 @@ Status SSTableReader::ReadDataBlock(uint64_t offset, uint32_t size,
 
 Status SSTableReader::VerifyBlockChecksum(const Slice &block,
                                           uint32_t expected_crc) {
-  if (block.size() < BlockHeader::kHeaderSize) {
-    return Status::Corruption("Block too small");
-  }
-
-  uint32_t actual_crc =
-      hash_util::CRC32(block.data() + BlockHeader::kHeaderSize,
-                       block.size() - BlockHeader::kHeaderSize);
+  // 调用方传入的是去掉块头后的块内容，直接对整体计算CRC即可
+  uint32_t actual_crc = hash_util::CRC32(block.data(), block.size());
   if (actual_crc != expected_crc) {
     return Status::Corruption("Block checksum mismatch");
   }
@@ -1204,13 +1212,21 @@ int SSTableReader::FindIndexEntry(const Slice &key) const {
     return -1;
   }
 
-  // 二分查找第一个大于等于key的索引项
+  // 二分查找最后一个首键不大于key的索引项
+  // 注意：索引键是内部键（用户键+8字节序列后缀），比较时只取用户键部分
   int left = 0, right = static_cast<int>(index_.size()) - 1;
   int result = -1;
 
+  auto index_user_key = [](const std::string &internal_key) {
+    if (internal_key.size() < 8) {
+      return Slice(internal_key);
+    }
+    return Slice(internal_key.data(), internal_key.size() - 8);
+  };
+
   while (left <= right) {
     int mid = left + (right - left) / 2;
-    int cmp = comparator_->Compare(Slice(index_[mid].key), key);
+    int cmp = comparator_->Compare(index_user_key(index_[mid].key), key);
 
     if (cmp <= 0) {
       result = mid;
@@ -1385,6 +1401,25 @@ Status SSTableWriter::Finish() {
     return s;
   }
 
+  // 写入Footer（48字节：meta/index/bloom块位置 + 版本 + 魔数）
+  {
+    std::string footer;
+    coding::PutVarint64(&footer, meta_block_offset_);
+    coding::PutVarint32(&footer, meta_block_size_);
+    coding::PutVarint64(&footer, index_block_offset_);
+    coding::PutVarint32(&footer, index_block_size_);
+    coding::PutVarint64(&footer, bloom_block_offset_);
+    coding::PutVarint32(&footer, bloom_block_size_);
+    coding::PutVarint32(&footer, 1);               // 格式版本
+    coding::PutVarint32(&footer, 0x57A7AB1E);      // 魔数
+    footer.resize(48, '\0');                       // 固定48字节，不足补零
+    s = file_->Append(Slice(footer));
+    if (!s.ok()) {
+      return s;
+    }
+    current_offset_ += 48;
+  }
+
   // 刷新文件
   s = file_->Flush();
   if (!s.ok()) {
@@ -1498,6 +1533,11 @@ Status SSTableWriter::WriteIndexBlock() {
     coding::PutLengthPrefixedSlice(&index_data, Slice(encoded_entry));
   }
 
+  // 记录索引块位置（供Footer使用）
+  index_block_offset_ = current_offset_;
+  index_block_size_ =
+      static_cast<uint32_t>(BlockHeader::kHeaderSize + index_data.size());
+
   // 写入索引块
   Status s = WriteBlockHeader(BlockType::kIndexBlock, Slice(index_data));
   if (!s.ok()) {
@@ -1529,6 +1569,11 @@ Status SSTableWriter::WriteBloomFilterBlock() {
     return Status::OK();
   }
 
+  // 记录Bloom块位置（供Footer使用）
+  bloom_block_offset_ = current_offset_;
+  bloom_block_size_ =
+      static_cast<uint32_t>(BlockHeader::kHeaderSize + bloom_data.size());
+
   // 写入Bloom过滤器块
   Status s = WriteBlockHeader(BlockType::kBloomBlock, bloom_data);
   if (!s.ok()) {
@@ -1551,6 +1596,11 @@ Status SSTableWriter::WriteBloomFilterBlock() {
 Status SSTableWriter::WriteMetaBlock() {
   // 编码元数据
   std::string meta_data = meta_.Encode();
+
+  // 记录元数据块位置（供Footer使用）
+  meta_block_offset_ = current_offset_;
+  meta_block_size_ =
+      static_cast<uint32_t>(BlockHeader::kHeaderSize + meta_data.size());
 
   // 写入元数据块
   Status s = WriteBlockHeader(BlockType::kMetaBlock, Slice(meta_data));
@@ -1703,28 +1753,39 @@ Status SSTableCompactor::FlushMemTable(const MemTable *memtable,
     return s;
   }
 
-  // 创建MemTable迭代器并写入所有数据
+  // 收集MemTable全部条目后按内部键字节序排序写入：
+  // MemTable迭代器按InternalKeyComparator序（同用户键新版本在前），
+  // 而SSTable内要求字节序（同用户键旧版本在前），直接写入会违反升序约束
+  struct Entry {
+    std::string key;
+    std::string value;
+  };
+  std::vector<Entry> entries;
+
   auto iter = memtable->NewIterator();
   iter->SeekToFirst();
-
   while (iter->Valid()) {
-    // 重新构造完整的InternalKey
     InternalKey internal_key(iter->key(), iter->sequence(), iter->type());
-    std::string encoded_key = internal_key.Encode();
-
-    s = writer.Add(Slice(encoded_key), iter->value());
-    if (!s.ok()) {
-      writer.Abandon();
-      return s;
-    }
+    entries.push_back(Entry{internal_key.Encode(), iter->value().ToString()});
     iter->Next();
   }
 
-  // 检查迭代器状态
   s = iter->status();
   if (!s.ok()) {
     writer.Abandon();
     return s;
+  }
+
+  // 按内部键字节序排序（用户键升序，同键序列号字节升序）
+  std::sort(entries.begin(), entries.end(),
+            [](const Entry &a, const Entry &b) { return a.key < b.key; });
+
+  for (const auto &entry : entries) {
+    s = writer.Add(Slice(entry.key), Slice(entry.value));
+    if (!s.ok()) {
+      writer.Abandon();
+      return s;
+    }
   }
 
   // 完成写入
@@ -2262,67 +2323,60 @@ Status SSTableManager::UnregisterSSTable(uint64_t file_number) {
 
 Status SSTableManager::Get(const Slice &key, std::string *value, bool *found,
                            uint64_t snapshot) {
-  std::shared_lock<std::shared_mutex> lock(mutex_);
-
   *found = false;
 
-  // 按层级顺序搜索（L0 -> L1 -> L2 ...）
-  for (size_t level = 0; level < level_files_.size(); ++level) {
-    const auto &level_files = level_files_[level];
+  // 在锁内收集候选文件编号（GetReader内部需要独占锁，不能持锁调用）
+  std::vector<uint64_t> candidates;
+  {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
 
-    if (level == 0) {
-      // L0层文件可能重叠，需要搜索所有可能包含键的文件
-      for (auto it = level_files.rbegin(); it != level_files.rend(); ++it) {
-        const SSTableMeta &meta = *it;
+    // 按层级顺序搜索（L0 -> L1 -> L2 ...）
+    for (size_t level = 0; level < level_files_.size(); ++level) {
+      const auto &level_files = level_files_[level];
 
-        if (!meta.KeyInRange(key, comparator_)) {
-          continue;
-        }
-
-        SSTableReader *reader = GetReader(meta.file_number);
-        if (!reader) {
-          continue;
-        }
-
-        if (!reader->MayContainKey(key)) {
-          continue;
-        }
-
-        bool file_found = false;
-        Status s = reader->Get(key, value, &file_found, snapshot);
-        if (!s.ok()) {
-          return s;
-        }
-
-        if (file_found) {
-          *found = true;
-          return Status::OK();
-        }
-      }
-    } else {
-      // L1+层文件不重叠，可以使用二分查找
-      auto it = std::lower_bound(
-          level_files.begin(), level_files.end(), key,
-          [this](const SSTableMeta &meta, const Slice &target_key) {
-            return comparator_->Compare(Slice(meta.largest_key), target_key) <
-                   0;
-          });
-
-      if (it != level_files.end() && it->KeyInRange(key, comparator_)) {
-        SSTableReader *reader = GetReader(it->file_number);
-        if (reader && reader->MayContainKey(key)) {
-          bool file_found = false;
-          Status s = reader->Get(key, value, &file_found, snapshot);
-          if (!s.ok()) {
-            return s;
-          }
-
-          if (file_found) {
-            *found = true;
-            return Status::OK();
+      if (level == 0) {
+        // L0层文件可能重叠，需要搜索所有可能包含键的文件（新文件优先）
+        for (auto it = level_files.rbegin(); it != level_files.rend(); ++it) {
+          if (it->KeyInRange(key, comparator_)) {
+            candidates.push_back(it->file_number);
           }
         }
+      } else {
+        // L1+层文件不重叠，可以使用二分查找
+        auto it = std::lower_bound(
+            level_files.begin(), level_files.end(), key,
+            [this](const SSTableMeta &meta, const Slice &target_key) {
+              return comparator_->Compare(Slice(meta.largest_key), target_key) <
+                     0;
+            });
+
+        if (it != level_files.end() && it->KeyInRange(key, comparator_)) {
+          candidates.push_back(it->file_number);
+        }
       }
+    }
+  }
+
+  // 逐个打开读取器查找
+  for (uint64_t file_number : candidates) {
+    SSTableReader *reader = GetReader(file_number);
+    if (!reader) {
+      continue;
+    }
+
+    if (!reader->MayContainKey(key)) {
+      continue;
+    }
+
+    bool file_found = false;
+    Status s = reader->Get(key, value, &file_found, snapshot);
+    if (!s.ok()) {
+      return s;
+    }
+
+    if (file_found) {
+      *found = true;
+      return Status::OK();
     }
   }
 
@@ -2735,8 +2789,12 @@ Status SSTableManager::ValidateFileMeta(const SSTableMeta &meta) {
 
 std::string SSTableManager::GenerateFileName(uint64_t file_number,
                                              SSTableLevel level) const {
-  return "sst_" + std::to_string(file_number) + "_L" +
-         std::to_string(static_cast<int>(level)) + ".sst";
+  std::string name = "sst_" + std::to_string(file_number) + "_L" +
+                     std::to_string(static_cast<int>(level)) + ".sst";
+  if (options_.directory.empty()) {
+    return name;
+  }
+  return options_.directory + "/" + name;
 }
 
 // ============================================================================
