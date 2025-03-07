@@ -224,6 +224,9 @@ public:
     
     // 清理旧WAL文件
     Status CleanupOldWALFiles(SequenceNumber safe_sequence);
+
+    // 清空所有WAL文件（干净关闭时数据已落盘到SSTable后调用）
+    Status TruncateLogs();
     
     // 获取当前WAL文件大小
     uint64_t GetCurrentWALSize() const;

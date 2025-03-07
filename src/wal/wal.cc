@@ -993,6 +993,63 @@ Status WALManager::RecoverFromWAL(SequenceNumber* last_sequence) {
     }
     
     *last_sequence = max_sequence;
+    if (max_sequence > 0) {
+        last_sequence_.store(max_sequence);
+    }
+
+    // 重放完成：删除已重放的WAL文件，避免下次打开时重复应用
+    // （当前写入器对应的新文件保留）
+    for (const auto &filename : wal_files) {
+        if (filename == current_wal_filename_) {
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::remove(filename, ec);
+    }
+
+    return Status::OK();
+}
+
+Status WALManager::TruncateLogs() {
+    std::lock_guard<std::mutex> lock(wal_mutex_);
+
+    // 关闭当前写入器
+    if (current_writer_) {
+        current_writer_->Close();
+        current_writer_.reset();
+    }
+    current_wal_filename_.clear();
+
+    std::error_code ec;
+    std::string wal_dir = db_path_ + "/wal";
+    if (std::filesystem::exists(wal_dir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(wal_dir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            std::string filename = entry.path().filename().string();
+            if (filename.size() > 4 && filename.substr(filename.size() - 4) == ".wal") {
+                std::filesystem::remove(entry.path(), ec);
+            }
+        }
+    }
+
+    // 归档目录一并清理
+    std::string archive_dir = db_path_ + "/archive";
+    if (std::filesystem::exists(archive_dir)) {
+        for (const auto& entry : std::filesystem::directory_iterator(archive_dir, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file()) continue;
+            std::string filename = entry.path().filename().string();
+            if (filename.size() > 4 && filename.substr(filename.size() - 4) == ".wal") {
+                std::filesystem::remove(entry.path(), ec);
+            }
+        }
+    }
+
+    next_file_number_.store(1);
+    last_sequence_.store(0);
+
+    LOG_INFO << "WAL files truncated, next file number reset to 1";
     return Status::OK();
 }
 
@@ -1842,9 +1899,10 @@ Status ValidateWALRecord(const WALRecord& record) {
         return Status::Corruption("WAL record CRC mismatch");
     }
     
-    // 验证记录类型
+    // 验证记录类型（枚举值1..11，与WALRecordType一致）
     int type_value = static_cast<int>(record.type);
-    if (type_value < 1 || type_value > 8) {
+    if (type_value < static_cast<int>(WALRecordType::kPut) ||
+        type_value > static_cast<int>(WALRecordType::kUpdateColumnFamilyOptions)) {
         return Status::Corruption("Invalid WAL record type");
     }
     
@@ -1860,14 +1918,154 @@ Status CopyWALFile(const std::string& src, const std::string& dst) {
     }
 }
 
+// 简单RLE压缩（PackBits风格）：
+// - 控制字节 0..127：后跟 n+1 个字面字节
+// - 控制字节 129..255：后跟 1 个字节，重复 (n-125) 次（即3..130次）
+// 该实现零外部依赖，压缩率取决于WAL记录的重复程度
+static std::string RLECompress(const std::string& data) {
+    std::string out;
+    out.reserve(data.size());
+    size_t i = 0;
+    const size_t n = data.size();
+
+    while (i < n) {
+        // 检查从当前位置开始的重复字节
+        size_t run_end = i + 1;
+        while (run_end < n && data[run_end] == data[i] &&
+               run_end - i < 130) {
+            ++run_end;
+        }
+
+        if (run_end - i >= 3) {
+            // 压缩重复串
+            out.push_back(static_cast<char>((run_end - i - 3) | 0x80));
+            out.push_back(data[i]);
+            i = run_end;
+        } else {
+            // 收集字面字节段
+            size_t literal_start = i;
+            size_t literal_end = i;
+            while (literal_end < n) {
+                size_t next_run_end = literal_end + 1;
+                while (next_run_end < n && data[next_run_end] == data[literal_end] &&
+                       next_run_end - literal_end < 130) {
+                    ++next_run_end;
+                }
+                if (next_run_end - literal_end >= 3) {
+                    break; // 后面有可压缩的重复串，字面段到此为止
+                }
+                ++literal_end;
+                if (literal_end - literal_start == 128) {
+                    break; // 单段字面最大128字节
+                }
+            }
+            if (literal_end == literal_start) {
+                ++literal_end; // 至少前进一个字节
+            }
+            out.push_back(static_cast<char>(literal_end - literal_start - 1));
+            out.append(data, literal_start, literal_end - literal_start);
+            i = literal_end;
+        }
+    }
+
+    return out;
+}
+
+static bool RLEDecompress(const std::string& data, std::string* out) {
+    out->clear();
+    size_t i = 0;
+    const size_t n = data.size();
+
+    while (i < n) {
+        unsigned char ctrl = static_cast<unsigned char>(data[i++]);
+        if (ctrl <= 127) {
+            // 字面段
+            size_t len = static_cast<size_t>(ctrl) + 1;
+            if (i + len > n) {
+                return false;
+            }
+            out->append(data, i, len);
+            i += len;
+        } else {
+            // 重复串
+            size_t len = static_cast<size_t>(ctrl) - 125;
+            if (i >= n) {
+                return false;
+            }
+            out->append(len, data[i]);
+            ++i;
+        }
+    }
+
+    return true;
+}
+
 Status CompressWALFile(const std::string& filename) {
-    // 简化实现 - 实际需要压缩算法
-    return Status::NotSupported("WAL compression not implemented");
+    try {
+        std::ifstream in(filename, std::ios::binary);
+        if (!in.is_open()) {
+            return Status::IOError("Failed to open WAL file for compression");
+        }
+
+        std::string data((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        in.close();
+
+        if (data.empty()) {
+            return Status::OK();
+        }
+
+        std::string compressed = RLECompress(data);
+        std::string compressed_filename = filename + ".compressed";
+        std::ofstream out(compressed_filename, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return Status::IOError("Failed to create compressed WAL file");
+        }
+        out.write(compressed.data(), compressed.size());
+        out.close();
+
+        return Status::OK();
+    } catch (const std::exception& e) {
+        return Status::IOError("Failed to compress WAL file: " + std::string(e.what()));
+    }
 }
 
 Status DecompressWALFile(const std::string& compressed_filename) {
-    // 简化实现 - 实际需要解压缩算法
-    return Status::NotSupported("WAL decompression not implemented");
+    try {
+        std::ifstream in(compressed_filename, std::ios::binary);
+        if (!in.is_open()) {
+            return Status::IOError("Failed to open compressed WAL file");
+        }
+
+        std::string data((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+        in.close();
+
+        std::string decompressed;
+        if (!RLEDecompress(data, &decompressed)) {
+            return Status::Corruption("Corrupted compressed WAL data");
+        }
+
+        // 输出文件名：去掉.compressed后缀
+        std::string output_filename = compressed_filename;
+        const std::string suffix = ".compressed";
+        if (output_filename.size() > suffix.size() &&
+            output_filename.compare(output_filename.size() - suffix.size(),
+                                    suffix.size(), suffix) == 0) {
+            output_filename.resize(output_filename.size() - suffix.size());
+        }
+
+        std::ofstream out(output_filename, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return Status::IOError("Failed to create decompressed WAL file");
+        }
+        out.write(decompressed.data(), decompressed.size());
+        out.close();
+
+        return Status::OK();
+    } catch (const std::exception& e) {
+        return Status::IOError("Failed to decompress WAL file: " + std::string(e.what()));
+    }
 }
 
 }  // namespace wal_util
