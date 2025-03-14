@@ -344,6 +344,9 @@ private:
   // 生成文件路径
   std::string GetSSTablePath(uint64_t file_number, SSTableLevel level) const;
 
+  // 加载磁盘上已有的SSTable文件（打开数据库时调用）
+  Status LoadExistingSSTables();
+
 private:
   // 配置
   LSMTreeOptions options_;
@@ -424,7 +427,13 @@ public:
 
 private:
   void FindSmallest();
+  void FindLargest();
   void ClearChildren();
+
+  // 内部键比较：用户键升序，同键新版本（大序列号）在前
+  int CompareInternalKeys(const Slice &a, const Slice &b) const;
+  // 选择最佳子迭代器（prefer_newest=true取最小，false取最大）
+  int PickChild(bool prefer_newest, bool *is_sstable);
 
 private:
   const LSMTree *lsm_tree_;

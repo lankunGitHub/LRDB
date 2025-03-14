@@ -5,6 +5,7 @@
 #include "lrdb/util/logging.h"
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <sstream>
 
 namespace lrdb {
@@ -33,7 +34,8 @@ Status LSMTree::Open(Env *env, const Comparator *comparator,
     return Status::InvalidArgument("LSMTree already opened");
   }
 
-  env_ = env;
+  // 未提供环境时回退到默认环境，保证SSTable刷盘路径可用
+  env_ = env ? env : Env::Default();
   comparator_ = comparator;
   bg_manager_ = bg_manager;
 
@@ -51,6 +53,12 @@ Status LSMTree::Open(Env *env, const Comparator *comparator,
 
   // 初始化组件
   s = InitializeComponents();
+  if (!s.ok()) {
+    return s;
+  }
+
+  // 加载磁盘上已有的SSTable（重开数据库时恢复数据）
+  s = LoadExistingSSTables();
   if (!s.ok()) {
     return s;
   }
@@ -235,16 +243,16 @@ Status LSMTree::Get(const Slice &key, std::string *value, uint64_t snapshot) {
 
   stats_num_gets_.fetch_add(1);
 
-  if (snapshot == 0) {
-    snapshot = next_sequence_number_.load();
-  }
-
+  // snapshot=0表示读取最新数据，直接传递即可。
+  // 不能用next_sequence_number_替换：重开数据库后该计数器尚未推进，
+  // 会错误地遮蔽序列号更大的已持久化版本
   std::shared_lock<std::shared_mutex> lock(mutex_);
 
   // 首先在MemTable中查找
   bool found = false;
   Status s = GetFromMemTables(key, value, snapshot, &found);
-  if (!s.ok() && !s.IsMergeInProgress()) {
+  // MemTable未命中（NotFound）需要继续查SSTable，只有真正的错误才提前返回
+  if (!s.ok() && !s.IsNotFound() && !s.IsMergeInProgress()) {
     return s;
   }
 
@@ -632,10 +640,76 @@ Status LSMTree::InitializeComponents() {
   SSTableManagerOptions sstable_opts;
   sstable_opts.max_open_files = 1000;
   sstable_opts.table_cache_size = 256 * 1024 * 1024; // 256MB
+  sstable_opts.directory = options_.db_path + "/sstables";
   sstable_manager_ =
       std::make_unique<SSTableManager>(env_, comparator_, sstable_opts);
 
   // MemTableManager已经自动创建了初始的mutable MemTable
+  return Status::OK();
+}
+
+Status LSMTree::LoadExistingSSTables() {
+  std::string sstable_dir = options_.db_path + "/sstables";
+  std::error_code ec;
+  if (!std::filesystem::exists(sstable_dir, ec)) {
+    return Status::OK();
+  }
+
+  uint64_t max_file_number = 0;
+  size_t loaded = 0;
+
+  for (const auto &entry : std::filesystem::directory_iterator(sstable_dir, ec)) {
+    if (ec || !entry.is_regular_file()) continue;
+
+    std::string filename = entry.path().filename().string();
+    // 格式: sst_<file_number>_L<level>.sst
+    if (filename.rfind("sst_", 0) != 0) continue;
+    size_t second_underscore = filename.find('_', 4);
+    if (second_underscore == std::string::npos) continue;
+    size_t l_pos = filename.find("_L", second_underscore);
+    if (l_pos == std::string::npos) continue;
+    if (filename.size() < 5 || filename.compare(filename.size() - 4, 4, ".sst") != 0) continue;
+
+    uint64_t file_number = 0;
+    int level = 0;
+    try {
+      file_number = std::stoull(filename.substr(4, second_underscore - 4));
+      level = std::stoi(filename.substr(l_pos + 2, filename.size() - 4 - (l_pos + 2)));
+    } catch (const std::exception &) {
+      continue;
+    }
+
+    SSTableReader reader;
+    Status s = reader.Open(entry.path().string(), env_, comparator_);
+    if (!s.ok()) {
+      LOG_WARN << "Failed to open existing SSTable " << filename << ": "
+               << s.ToString();
+      continue;
+    }
+
+    SSTableMeta meta = reader.GetMeta();
+    // 文件内的meta块不携带文件编号（历史格式缺陷），以文件名为准回填
+    meta.filename = entry.path().string();
+    meta.file_number = file_number;
+    meta.level = static_cast<SSTableLevel>(level);
+    s = sstable_manager_->RegisterSSTable(meta);
+    if (!s.ok()) {
+      LOG_WARN << "Failed to register existing SSTable " << filename << ": "
+               << s.ToString();
+      continue;
+    }
+
+    max_file_number = std::max(max_file_number, file_number);
+    ++loaded;
+  }
+
+  if (loaded > 0) {
+    // 推进文件编号，避免与新生成的SSTable重名
+    sstable_manager_->SetNextFileNumber(max_file_number + 1);
+    LOG_INFO << "Loaded " << loaded << " existing SSTables, next file number: "
+             << max_file_number + 1;
+  }
+
   return Status::OK();
 }
 
@@ -969,23 +1043,33 @@ Status LSMTree::ValidateOptions() const {
 }
 
 Status LSMTree::CreateDirectories() {
-  // 如果没有环境，跳过目录创建
-  if (!env_) {
-    LOG_INFO << "Environment not available, skipping directory creation";
-    return Status::OK();
-  }
+  std::error_code ec;
 
-  // 创建主数据目录
-  Status s = env_->CreateDirIfMissing(options_.db_path);
-  if (!s.ok()) {
-    return s;
+  // 创建主数据目录（优先走环境，未提供时直接使用文件系统）
+  if (env_) {
+    Status s = env_->CreateDirIfMissing(options_.db_path);
+    if (!s.ok()) {
+      return s;
+    }
+  } else {
+    std::filesystem::create_directories(options_.db_path, ec);
+    if (ec) {
+      return Status::IOError("Failed to create db directory: " + ec.message());
+    }
   }
 
   // 创建SSTable目录
   std::string sstable_dir = options_.db_path + "/sstables";
-  s = env_->CreateDirIfMissing(sstable_dir);
-  if (!s.ok()) {
-    return s;
+  if (env_) {
+    Status s = env_->CreateDirIfMissing(sstable_dir);
+    if (!s.ok()) {
+      return s;
+    }
+  } else {
+    std::filesystem::create_directories(sstable_dir, ec);
+    if (ec) {
+      return Status::IOError("Failed to create sstable directory: " + ec.message());
+    }
   }
 
   return Status::OK();
@@ -1092,11 +1176,11 @@ LSMTreeMergeIterator::LSMTreeMergeIterator(const LSMTree *lsm_tree,
       comparator_(lsm_tree->comparator_), current_memtable_index_(-1),
       current_sstable_index_(-1), valid_(false) {
 
-  if (snapshot_ == 0) {
-    snapshot_ = lsm_tree_->next_sequence_number_.load();
-  }
+  // snapshot=0表示读取最新数据，直接传递。
+  // 不能用next_sequence_number_替换：重开数据库后该计数器尚未推进，
+  // 会错误地遮蔽序列号更大的已持久化版本
 
-  // 创建MemTable迭代器
+  // 创建MemTable迭代器（mutable + immutable，新数据优先于旧数据）
   MemTable *active = lsm_tree_->memtable_manager_->GetMutableMemTable();
   if (active) {
     memtable_iters_.push_back(active->NewIterator());
@@ -1107,8 +1191,15 @@ LSMTreeMergeIterator::LSMTreeMergeIterator(const LSMTree *lsm_tree,
     memtable_iters_.push_back(memtable->NewIterator());
   }
 
-  // 简化实现：暂时不使用SSTable迭代器
-  // 实际应用中需要实现完整的多路归并迭代器
+  // 创建各层级SSTable迭代器
+  auto level_stats = lsm_tree_->sstable_manager_->GetLevelStats();
+  for (const auto &stat : level_stats) {
+    if (stat.num_files == 0) continue;
+    auto level_iter = lsm_tree_->sstable_manager_->NewLevelIterator(stat.level);
+    if (level_iter) {
+      sstable_iters_.push_back(std::move(level_iter));
+    }
+  }
 }
 
 LSMTreeMergeIterator::~LSMTreeMergeIterator() { ClearChildren(); }
@@ -1120,8 +1211,9 @@ void LSMTreeMergeIterator::SeekToFirst() {
   for (auto &iter : memtable_iters_) {
     iter->SeekToFirst();
   }
-
-  // 简化：暂时跳过SSTable迭代器
+  for (auto &iter : sstable_iters_) {
+    iter->SeekToFirst();
+  }
 
   // 找到最小的键
   FindSmallest();
@@ -1132,28 +1224,26 @@ void LSMTreeMergeIterator::SeekToLast() {
   for (auto &iter : memtable_iters_) {
     iter->SeekToLast();
   }
-
-  // 简化：暂时跳过SSTable迭代器
-
-  // 找到最大的键（实现比较复杂，这里简化）
-  valid_ = false;
-  for (auto &iter : memtable_iters_) {
-    if (iter->Valid()) {
-      valid_ = true;
-      current_key_ = iter->key().ToString();
-      current_value_ = iter->value().ToString();
-      break;
-    }
+  for (auto &iter : sstable_iters_) {
+    iter->SeekToLast();
   }
+
+  // 找到最大的键
+  FindLargest();
 }
 
 void LSMTreeMergeIterator::Seek(const Slice &target) {
-  // 将所有子迭代器定位到目标位置
+  // MemTable迭代器按内部键寻址（最大序列号落在该用户键的第一个版本上）
+  std::string internal_target;
+  coding::PutInternalKey(&internal_target, target, UINT64_MAX, 0xFF);
   for (auto &iter : memtable_iters_) {
-    iter->Seek(target);
+    iter->Seek(internal_target);
   }
 
-  // 简化：暂时跳过SSTable迭代器
+  // SSTable迭代器按用户键寻址（内部自行处理索引定位）
+  for (auto &iter : sstable_iters_) {
+    iter->Seek(target);
+  }
 
   // 找到最小的键
   FindSmallest();
@@ -1164,25 +1254,23 @@ void LSMTreeMergeIterator::Next() {
     return;
   }
 
-  // 移动当前最小键的迭代器
-  if (current_memtable_index_ >= 0 &&
-      current_memtable_index_ < static_cast<int>(memtable_iters_.size())) {
-    memtable_iters_[current_memtable_index_]->Next();
-  }
-
-  // 简化：暂时跳过SSTable迭代器
-
-  // 重新找到最小的键
+  // FindSmallest在返回前已把当前键的所有版本消费完毕，
+  // 各子迭代器都停在下一个键上，直接重新归并即可
   FindSmallest();
 }
 
 void LSMTreeMergeIterator::Prev() {
-  // 简化实现：不支持向后迭代
-  valid_ = false;
-  status_ = Status::NotSupported("Backward iteration not supported");
+  if (!valid_) {
+    return;
+  }
+
+  // FindLargest在返回前已把当前键的所有版本消费完毕，
+  // 各子迭代器都停在前一个键上，直接重新归并即可
+  FindLargest();
 }
 
 Slice LSMTreeMergeIterator::key() const {
+  // 对外暴露用户键（内部键已剥离8字节序列后缀）
   return valid_ ? Slice(current_key_) : Slice();
 }
 
@@ -1202,10 +1290,57 @@ Status LSMTreeMergeIterator::status() const {
       return s;
     }
   }
-
-  // 简化：暂时跳过SSTable迭代器状态检查
+  for (const auto &iter : sstable_iters_) {
+    Status s = iter->status();
+    if (!s.ok()) {
+      return s;
+    }
+  }
 
   return Status::OK();
+}
+
+// 比较两个内部键：按字节序（用户键升序；同一用户键时旧版本在前）。
+// 内部键编码为[用户键+8字节(序列号<<8|类型)]，字节序天然满足该语义，
+// 且与SSTable内存储顺序一致，两个来源（MemTable/SSTable）可直接归并
+int LSMTreeMergeIterator::CompareInternalKeys(const Slice &a,
+                                              const Slice &b) const {
+  return a.compare(b);
+}
+
+// 选择最佳子迭代器（返回-1表示没有有效子迭代器；通过is_sstable区分来源）
+int LSMTreeMergeIterator::PickChild(bool prefer_newest, bool *is_sstable) {
+  int best_index = -1;
+  *is_sstable = false;
+  std::string best_key;
+
+  auto consider = [&](const Slice &candidate_key, int index, bool from_sstable) {
+    if (best_index < 0) {
+      best_index = index;
+      *is_sstable = from_sstable;
+      best_key = candidate_key.ToString();
+      return;
+    }
+    int cmp = CompareInternalKeys(candidate_key, Slice(best_key));
+    if (prefer_newest ? cmp < 0 : cmp > 0) {
+      best_index = index;
+      *is_sstable = from_sstable;
+      best_key = candidate_key.ToString();
+    }
+  };
+
+  for (int i = 0; i < static_cast<int>(memtable_iters_.size()); ++i) {
+    if (memtable_iters_[i]->Valid()) {
+      consider(memtable_iters_[i]->key(), i, false);
+    }
+  }
+  for (int i = 0; i < static_cast<int>(sstable_iters_.size()); ++i) {
+    if (sstable_iters_[i]->Valid()) {
+      consider(sstable_iters_[i]->key(), i, true);
+    }
+  }
+
+  return best_index;
 }
 
 void LSMTreeMergeIterator::FindSmallest() {
@@ -1213,50 +1348,211 @@ void LSMTreeMergeIterator::FindSmallest() {
   current_memtable_index_ = -1;
   current_sstable_index_ = -1;
 
-  Slice smallest_key;
-  bool has_smallest = false;
-
-  // 在MemTable迭代器中找到最小键
-  for (int i = 0; i < static_cast<int>(memtable_iters_.size()); ++i) {
-    auto &iter = memtable_iters_[i];
-    if (iter->Valid()) {
-      Slice current_key = iter->key();
-
-      // 检查快照可见性
-      Slice user_key;
-      uint64_t seq;
-      uint8_t type;
-      if (coding::ParseInternalKey(current_key, &user_key, &seq, &type)) {
-        if (seq <= snapshot_) {
-          if (!has_smallest ||
-              comparator_->Compare(current_key, smallest_key) < 0) {
-            smallest_key = current_key;
-            current_memtable_index_ = i;
-            current_sstable_index_ = -1;
-            has_smallest = true;
-            valid_ = true;
-            current_key_ = current_key.ToString();
-            current_value_ = iter->value().ToString();
-          }
-        }
-      }
+  while (true) {
+    bool is_sstable = false;
+    int best = PickChild(true, &is_sstable);
+    if (best < 0) {
+      return; // 没有更多键
     }
-  }
 
-  // 简化：暂时跳过SSTable迭代器
-
-  // 如果找到的是删除标记，需要跳过
-  if (valid_) {
+    // 取最佳键的用户键/序列号/类型
+    std::string best_internal = is_sstable
+                                    ? sstable_iters_[best]->key().ToString()
+                                    : memtable_iters_[best]->key().ToString();
     Slice user_key;
     uint64_t seq;
     uint8_t type;
-    if (coding::ParseInternalKey(Slice(current_key_), &user_key, &seq, &type)) {
-      if (type == static_cast<uint8_t>(ValueType::kDeletion)) {
-        // 这是一个删除标记，跳过
-        Next();
-        return;
+    if (!coding::ParseInternalKey(best_internal, &user_key, &seq, &type)) {
+      // 无法解析，推进后重试
+      if (is_sstable) sstable_iters_[best]->Next();
+      else memtable_iters_[best]->Next();
+      continue;
+    }
+
+    std::string best_user_key = user_key.ToString();
+
+    // 版本对快照不可见，跳过（snapshot_==0表示读取最新，全部可见）
+    if (snapshot_ != 0 && seq > snapshot_) {
+      if (is_sstable) sstable_iters_[best]->Next();
+      else memtable_iters_[best]->Next();
+      continue;
+    }
+
+    // 在best子迭代器内推进到该用户键的最后一个可见版本
+    // （子迭代器内部同键版本按序列号升序排列，越靠后越新）
+    std::string final_value =
+        is_sstable ? sstable_iters_[best]->value().ToString()
+                   : memtable_iters_[best]->value().ToString();
+    bool final_is_delete = (type == static_cast<uint8_t>(ValueType::kDeletion));
+
+    while (true) {
+      bool advanced;
+      if (is_sstable) {
+        sstable_iters_[best]->Next();
+        advanced = sstable_iters_[best]->Valid();
+      } else {
+        memtable_iters_[best]->Next();
+        advanced = memtable_iters_[best]->Valid();
+      }
+      if (!advanced) break;
+
+      Slice next_key = is_sstable ? sstable_iters_[best]->key()
+                                  : memtable_iters_[best]->key();
+      Slice next_user;
+      uint64_t next_seq;
+      uint8_t next_type;
+      if (!coding::ParseInternalKey(next_key, &next_user, &next_seq, &next_type) ||
+          comparator_->Compare(next_user, Slice(best_user_key)) != 0) {
+        break; // 已到下一个用户键
+      }
+      if (snapshot_ != 0 && next_seq > snapshot_) {
+        continue; // 该版本对快照不可见
+      }
+      final_value = is_sstable ? sstable_iters_[best]->value().ToString()
+                               : memtable_iters_[best]->value().ToString();
+      final_is_delete = (next_type == static_cast<uint8_t>(ValueType::kDeletion));
+    }
+
+    // 其他子迭代器中同一用户键的更旧版本全部跳过
+    for (int i = 0; i < static_cast<int>(memtable_iters_.size()); ++i) {
+      if (is_sstable || i != best) {
+        while (memtable_iters_[i]->Valid()) {
+          Slice uk;
+          uint64_t s;
+          uint8_t t;
+          if (!coding::ParseInternalKey(memtable_iters_[i]->key(), &uk, &s, &t) ||
+              comparator_->Compare(uk, Slice(best_user_key)) != 0) {
+            break;
+          }
+          memtable_iters_[i]->Next();
+        }
       }
     }
+    for (int i = 0; i < static_cast<int>(sstable_iters_.size()); ++i) {
+      if (!is_sstable || i != best) {
+        while (sstable_iters_[i]->Valid()) {
+          Slice uk;
+          uint64_t s;
+          uint8_t t;
+          if (!coding::ParseInternalKey(sstable_iters_[i]->key(), &uk, &s, &t) ||
+              comparator_->Compare(uk, Slice(best_user_key)) != 0) {
+            break;
+          }
+          sstable_iters_[i]->Next();
+        }
+      }
+    }
+
+    // 删除标记：该键被删除，跳过并继续
+    if (final_is_delete) {
+      continue;
+    }
+
+    current_key_ = best_user_key;
+    current_value_ = final_value;
+    current_memtable_index_ = is_sstable ? -1 : best;
+    current_sstable_index_ = is_sstable ? best : -1;
+    valid_ = true;
+    return;
+  }
+}
+
+void LSMTreeMergeIterator::FindLargest() {
+  valid_ = false;
+  current_memtable_index_ = -1;
+  current_sstable_index_ = -1;
+
+  while (true) {
+    bool is_sstable = false;
+    int best = PickChild(false, &is_sstable);
+    if (best < 0) {
+      return; // 没有更多键
+    }
+
+    std::string best_internal = is_sstable
+                                    ? sstable_iters_[best]->key().ToString()
+                                    : memtable_iters_[best]->key().ToString();
+    Slice user_key;
+    uint64_t seq;
+    uint8_t type;
+    if (!coding::ParseInternalKey(best_internal, &user_key, &seq, &type)) {
+      if (is_sstable) sstable_iters_[best]->Next();
+      else memtable_iters_[best]->Next();
+      continue;
+    }
+
+    std::string best_user_key = user_key.ToString();
+
+    // 向后遍历取该用户键最老的可见版本
+    bool found = false;
+    std::string candidate_value;
+    bool candidate_is_delete = false;
+    while (true) {
+      Slice cur_key;
+      if (is_sstable) {
+        if (!sstable_iters_[best]->Valid()) break;
+        cur_key = sstable_iters_[best]->key();
+      } else {
+        if (!memtable_iters_[best]->Valid()) break;
+        cur_key = memtable_iters_[best]->key();
+      }
+      Slice uk;
+      uint64_t s;
+      uint8_t t;
+      if (!coding::ParseInternalKey(cur_key, &uk, &s, &t) ||
+          comparator_->Compare(uk, Slice(best_user_key)) != 0) {
+        break;
+      }
+      if (snapshot_ == 0 || s <= snapshot_) {
+        found = true;
+        candidate_is_delete =
+            (t == static_cast<uint8_t>(ValueType::kDeletion));
+        candidate_value = is_sstable ? sstable_iters_[best]->value().ToString()
+                                     : memtable_iters_[best]->value().ToString();
+      }
+      if (is_sstable) sstable_iters_[best]->Next();
+      else memtable_iters_[best]->Next();
+    }
+
+    // 其他子迭代器中同一用户键的版本全部跳过（都已由本子迭代器覆盖）
+    for (int i = 0; i < static_cast<int>(memtable_iters_.size()); ++i) {
+      if (is_sstable || i != best) {
+        while (memtable_iters_[i]->Valid()) {
+          Slice uk;
+          uint64_t s;
+          uint8_t t;
+          if (!coding::ParseInternalKey(memtable_iters_[i]->key(), &uk, &s, &t) ||
+              comparator_->Compare(uk, Slice(best_user_key)) != 0) {
+            break;
+          }
+          memtable_iters_[i]->Next();
+        }
+      }
+    }
+    for (int i = 0; i < static_cast<int>(sstable_iters_.size()); ++i) {
+      if (!is_sstable || i != best) {
+        while (sstable_iters_[i]->Valid()) {
+          Slice uk;
+          uint64_t s;
+          uint8_t t;
+          if (!coding::ParseInternalKey(sstable_iters_[i]->key(), &uk, &s, &t) ||
+              comparator_->Compare(uk, Slice(best_user_key)) != 0) {
+            break;
+          }
+          sstable_iters_[i]->Next();
+        }
+      }
+    }
+
+    // 该键对快照不可见或被删除，跳过继续
+    if (!found || candidate_is_delete) {
+      continue;
+    }
+
+    current_key_ = best_user_key;
+    current_value_ = candidate_value;
+    valid_ = true;
+    return;
   }
 }
 
@@ -1442,7 +1738,19 @@ Status LSMTree::FinishRecovery(uint64_t final_sequence) {
     // 2. 退出恢复模式
     in_recovery_mode_.store(false);
 
-    // 3. 触发一次MemTable刷盘以确保恢复的数据持久化
+    // 3. 恢复缓冲非空时刷盘为L0 SSTable（WAL重放的记录在这里）
+    if (current_memtable_ && !current_memtable_->Empty()) {
+      SSTableMeta recovery_meta;
+      Status recovery_flush = sstable_manager_->FlushMemTableToSSTable(
+          current_memtable_.get(), SSTableLevel::kLevel0, &recovery_meta);
+      if (!recovery_flush.ok()) {
+        LOG_WARN << "Failed to flush recovered data to SSTable: "
+                 << recovery_flush.ToString();
+      }
+      current_memtable_.reset();
+    }
+
+    // 4. 触发一次MemTable刷盘以确保恢复的数据持久化
     Status flush_status = TriggerFlush();
     if (!flush_status.ok()) {
       LOG_WARN << "Failed to trigger flush after recovery: "
