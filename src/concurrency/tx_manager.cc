@@ -40,10 +40,10 @@ std::unique_ptr<Transaction> TxManager::BeginReadOnlyWithLSMSnapshot(const TxnOp
 
 SnapshotSequence TxManager::PrepareCommit(TransactionID txn_id, bool allocate_new_snapshot) {
     (void)txn_id;
-    if (allocate_new_snapshot) {
-        return snap_gen_.Next();
-    }
-    return snap_gen_.Current();
+    // 每次提交分配新的快照序列号，保证不同提交的版本可区分；
+    // 复用当前序列号会导致同一键的多个版本共享序号，破坏MVCC快照可见性
+    (void)allocate_new_snapshot;
+    return snap_gen_.Next();
 }
 
 void TxManager::OnCommitted(TransactionID txn_id) {

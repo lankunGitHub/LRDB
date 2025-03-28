@@ -56,6 +56,13 @@ public:
                       std::string* value,
                       bool* found) const;
 
+    // 按快照序列号读取：返回commit_snapshot <= snapshot_seq的最新已提交版本
+    // （快照读路径使用；删除标记表示为found=false且OK）
+    Status GetVisibleBySnapshot(const std::string& key,
+                                SnapshotSequence snapshot_seq,
+                                std::string* value,
+                                bool* found) const;
+
     // 列出所有 key 的“对该 ReadView 可见”的最新版本（包含删除标记）
     void CollectVisible(const ReadView& view,
                         std::vector<std::pair<std::string, VersionRecord>>* out) const;

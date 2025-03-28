@@ -93,6 +93,43 @@ Status VersionChainManager::GetVisible(const std::string& key,
     return Status::OK();
 }
 
+Status VersionChainManager::GetVisibleBySnapshot(const std::string& key,
+                                                 SnapshotSequence snapshot_seq,
+                                                 std::string* value,
+                                                 bool* found) const {
+    if (!value || !found) {
+        return Status::InvalidArgument("Null output parameter");
+    }
+    *found = false;
+
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    const auto* chain = ChainIfExists(key);
+    if (!chain) return Status::OK();
+
+    // 从尾到头扫描，找commit_snapshot <= snapshot_seq的最新提交版本
+    for (auto it = chain->rbegin(); it != chain->rend(); ++it) {
+        const VersionRecord& rec = *it;
+        if (rec.state != VersionState::kCommitted) {
+            continue;
+        }
+        if (rec.commit_snapshot > snapshot_seq) {
+            continue; // 该版本在快照之后提交，继续找更老的
+        }
+
+        if (rec.is_delete) {
+            // 可见的删除标记 => 键在快照下不存在
+            *found = false;
+            return Status::NotFound("Key deleted at snapshot");
+        }
+
+        *value = rec.value;
+        *found = true;
+        return Status::OK();
+    }
+
+    return Status::OK();
+}
+
 std::vector<std::pair<std::string, VersionRecord>> VersionChainManager::PickCommittedNotFlushed(size_t max_items) const {
     std::vector<std::pair<std::string, VersionRecord>> out;
     out.reserve(max_items);
