@@ -3,6 +3,7 @@
 #include "lrdb/db/manifest.h"
 #include "lrdb/core/coding.h"
 #include "lrdb/util/logging.h"
+#include "lrdb/util/comparator.h"
 
 #include <filesystem>
 #include <iomanip>
@@ -838,7 +839,7 @@ std::unique_ptr<ManifestManager> CreateManifestManager(const std::string& db_pat
 
 std::string EncodeColumnFamilyOptions(const ColumnFamilyOptions& options) {
     std::string result;
-    
+
     // 简化的选项编码，只编码关键字段
     coding::PutFixed32(&result, 64 * 1024 * 1024);  // 默认64MB
     coding::PutFixed32(&result, options.max_write_buffer_number);
@@ -848,7 +849,13 @@ std::string EncodeColumnFamilyOptions(const ColumnFamilyOptions& options) {
     coding::PutFixed64(&result, options.target_file_size_base);
     coding::PutFixed64(&result, options.max_bytes_for_level_base);
     result.push_back(static_cast<uint8_t>(options.compression));
-    
+
+    // 编码比较器名称（指针无法持久化，恢复时按名字查内置比较器）
+    std::string comparator_name = options.comparator ? options.comparator->Name() : "";
+    if (comparator_name.size() > 255) comparator_name.resize(255);
+    result.push_back(static_cast<uint8_t>(comparator_name.size()));
+    result.append(comparator_name);
+
     return result;
 }
 
@@ -856,9 +863,9 @@ Status DecodeColumnFamilyOptions(const Slice& data, ColumnFamilyOptions* options
     if (data.size() < 33) { // 4*5 + 8*2 + 1 = 33
         return Status::Corruption("ColumnFamilyOptions data too short");
     }
-    
+
     const char* p = data.data();
-    
+
     (void)coding::DecodeFixed32(p); p += 4;  // 跳过memtable_size字段
     options->max_write_buffer_number = coding::DecodeFixed32(p); p += 4;
     options->level0_file_num_compaction_trigger = coding::DecodeFixed32(p); p += 4;
@@ -867,7 +874,21 @@ Status DecodeColumnFamilyOptions(const Slice& data, ColumnFamilyOptions* options
     options->target_file_size_base = coding::DecodeFixed64(p); p += 8;
     options->max_bytes_for_level_base = coding::DecodeFixed64(p); p += 8;
     options->compression = static_cast<CompressionType>(*p++);
-    
+
+    // 比较器名称（旧格式没有该字段，此时用默认比较器）
+    if (static_cast<size_t>(p - data.data()) < data.size()) {
+        uint8_t name_len = static_cast<uint8_t>(*p++);
+        if (static_cast<size_t>(p - data.data()) + name_len <= data.size()) {
+            std::string name(p, name_len);
+            if (name == "lrdb.ReverseBytewiseComparator") {
+                options->comparator = ReverseBytewiseComparator();
+            } else {
+                // 未知比较器或字节序比较器，统一回退到默认字节序比较器
+                options->comparator = BytewiseComparator();
+            }
+        }
+    }
+
     return Status::OK();
 }
 

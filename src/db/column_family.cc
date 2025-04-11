@@ -48,18 +48,18 @@ DefaultColumnFamily::DefaultColumnFamily(uint32_t id, const std::string& name,
             throw std::runtime_error("Failed to create sequence generator for column family");
         }
         
-        // 3. 创建独立的WAL管理器
-        std::string wal_path = cf_data_path_ + "/wal";
-        wal_manager_ = std::make_unique<WALManager>(wal_path);
+        // 3. 创建独立的WAL管理器（传入列族数据目录，WAL文件位于其下wal/子目录）
+        wal_manager_ = std::make_unique<WALManager>(cf_data_path_);
         if (!wal_manager_) {
             throw std::runtime_error("Failed to create WAL manager for column family");
         }
-        
+
         // 4. 创建独立的LSMTree
         LSMTreeOptions lsm_options;
         lsm_options.memtable_size = options_.write_buffer_size;
         lsm_options.max_memtables = options_.max_write_buffer_number;
-        
+        lsm_options.db_path = cf_data_path_;
+
         lsm_tree_ = std::make_unique<LSMTree>(lsm_options);
         if (!lsm_tree_) {
             throw std::runtime_error("Failed to create LSM Tree for column family");
@@ -67,28 +67,36 @@ DefaultColumnFamily::DefaultColumnFamily(uint32_t id, const std::string& name,
 
         // 关联 WAL 与 LSMTree，用于恢复期间 ApplyWALRecord
         wal_manager_->SetLSMTree(lsm_tree_.get());
-        
-        // 5. 创建事务门面（每列族一套，不共享）
-        tx_manager_ = std::make_unique<TxManager>(wal_manager_.get(), lsm_tree_.get(), options_.comparator, id_);
-        if (!tx_manager_) {
-            throw std::runtime_error("Failed to create TxManager for column family");
-        }
-        
-        // 6. 初始化所有组件
-        Status wal_status = wal_manager_->Initialize();
-        if (!wal_status.ok()) {
-            throw std::runtime_error("Failed to initialize WAL: " + wal_status.ToString());
-        }
-        
-        // 注册MVCC->LSM刷回后台任务
-        // 背景任务调度已迁移至DB层统一或外部管理，这里不直接访问 options_.background_manager
-        
-        // 7. 打开LSMTree
+
+        // 5. 打开LSMTree（必须在WAL初始化之前，否则重放记录无处安放）
         Status lsm_status = lsm_tree_->Open(nullptr, options_.comparator, nullptr);
         if (!lsm_status.ok()) {
             throw std::runtime_error("Failed to open LSMTree: " + lsm_status.ToString());
         }
-        
+
+        // 6. 初始化WAL管理器（扫描现有WAL文件并重放到LSMTree恢复缓冲）
+        Status wal_status = wal_manager_->Initialize();
+        if (!wal_status.ok()) {
+            throw std::runtime_error("Failed to initialize WAL: " + wal_status.ToString());
+        }
+
+        // 7. 创建事务门面（每列族一套，不共享）
+        tx_manager_ = std::make_unique<TxManager>(wal_manager_.get(), lsm_tree_.get(), options_.comparator, id_);
+        if (!tx_manager_) {
+            throw std::runtime_error("Failed to create TxManager for column family");
+        }
+
+        // 8. 推进快照序列生成器并完成LSMTree恢复（刷盘恢复缓冲）
+        SequenceNumber recovered_sequence = wal_manager_->GetLastSequence();
+        if (recovered_sequence > 0) {
+            tx_manager_->RecoverSetSnapshot(recovered_sequence);
+            Status finish_status = lsm_tree_->FinishRecovery(recovered_sequence);
+            if (!finish_status.ok()) {
+                LOG_WARN << "Failed to finish LSMTree recovery for column family "
+                         << name_ << ": " << finish_status.ToString();
+            }
+        }
+
         // 标记为已初始化
         active_.store(true);
         
@@ -280,14 +288,27 @@ Status DefaultColumnFamily::Get(const Slice& key, uint64_t sequence, std::string
     if (!IsActive()) {
         return Status::InvalidArgument("Column family is not active");
     }
-    
+
     if (!lsm_tree_ || !value) {
         return Status::InvalidArgument("Invalid arguments for Get");
     }
-    
-    // 快照读取：主要从LSMTree读取历史版本
-    // 对于指定序列号的读取，版本链中通常不会有对应的数据
-    // 因为版本链主要存储未提交到LSMTree的最新数据
+
+    // 快照读取：先查版本链中快照可见的已提交版本，未命中再查LSMTree。
+    // 版本链返回NotFound表示键在快照下被删除，直接返回
+    if (tx_manager_) {
+        bool found = false;
+        Status chain_status =
+            tx_manager_->version_chain()->GetVisibleBySnapshot(key.ToString(),
+                                                               sequence, value,
+                                                               &found);
+        if (!chain_status.ok()) {
+            return chain_status;
+        }
+        if (found) {
+            return Status::OK();
+        }
+    }
+
     return lsm_tree_->Get(key, value, sequence);
 }
 
@@ -518,17 +539,29 @@ Status ColumnFamilyManager::Shutdown() {
     if (!initialized_.load()) {
         return Status::OK();
     }
-    
+
     try {
+        // 关闭所有列族（刷盘并释放资源）
+        std::shared_lock<std::shared_mutex> lock(column_families_mutex_);
+        for (const auto& [cf_id, cf] : column_families_by_id_) {
+            if (cf) {
+                Status shutdown_status = cf->Shutdown();
+                if (!shutdown_status.ok()) {
+                    LOG_WARN << "Failed to shutdown column family " << cf_id
+                             << ": " << shutdown_status.ToString();
+                }
+            }
+        }
+
         // 持久化列族信息
         Status s = PersistColumnFamilyInfo();
         if (!s.ok()) {
             return s;
         }
-        
+
         initialized_.store(false);
         return Status::OK();
-        
+
     } catch (const std::exception& e) {
         return Status::IOError("Failed to shutdown ColumnFamilyManager: " + std::string(e.what()));
     }
@@ -872,10 +905,25 @@ Status ColumnFamilyManager::CreateDefaultColumnFamily() {
     ColumnFamily* cf_ptr = default_cf.get();
     column_families_by_id_[column_family_util::kDefaultColumnFamilyId] = std::move(default_cf);
     column_families_by_name_[column_family_util::kDefaultColumnFamilyName] = cf_ptr;
-    
+
     // 保存默认列族指针
     default_column_family_ = cf_ptr;
-    
+
+    // 持久化到MANIFEST，保证重开数据库时能恢复默认列族
+    if (manifest_manager_) {
+        ColumnFamilyDescriptor default_desc;
+        default_desc.id = column_family_util::kDefaultColumnFamilyId;
+        default_desc.name = column_family_util::kDefaultColumnFamilyName;
+        default_desc.options = default_options;
+        default_desc.is_dropped = false;
+
+        Status manifest_status = manifest_manager_->LogCreateColumnFamily(default_desc);
+        if (!manifest_status.ok()) {
+            LOG_WARN << "Failed to persist default column family to MANIFEST: "
+                     << manifest_status.ToString();
+        }
+    }
+
     return Status::OK();
 }
 
@@ -895,10 +943,16 @@ Status ColumnFamilyManager::LoadExistingColumnFamilies() {
             if (cf_desc.is_dropped) {
                 continue;
             }
-            
+
+            // 反序列化的选项比较器指针为空，兜底为默认比较器
+            ColumnFamilyOptions cf_options = cf_desc.options;
+            if (!cf_options.comparator) {
+                cf_options.comparator = BytewiseComparator();
+            }
+
             // 创建列族实例
             auto cf = std::make_unique<DefaultColumnFamily>(
-                cf_desc.id, cf_desc.name, cf_desc.options, db_path_);
+                cf_desc.id, cf_desc.name, cf_options, db_path_);
             
             if (!cf) {
                 return Status::IOError("Failed to create column family: " + cf_desc.name);
@@ -1136,10 +1190,16 @@ Status ColumnFamilyManager::RecoverColumnFamilies() {
                 LOG_INFO << "Skipping dropped column family: " << cf_desc.name << " (ID: " << cf_desc.id << ")";
                 continue;
             }
-            
+
+            // 比较器指针无法持久化，反序列化后可能为空，这里兜底为默认比较器
+            ColumnFamilyOptions cf_options = cf_desc.options;
+            if (!cf_options.comparator) {
+                cf_options.comparator = BytewiseComparator();
+            }
+
             // 创建列族实例
             auto cf = std::make_unique<DefaultColumnFamily>(
-                cf_desc.id, cf_desc.name, cf_desc.options, db_path_);
+                cf_desc.id, cf_desc.name, cf_options, db_path_);
             
             Status init_status = cf->Initialize();
             if (!init_status.ok()) {
