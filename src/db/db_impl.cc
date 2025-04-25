@@ -2,6 +2,7 @@
 
 #include "lrdb/db/db.h"
 #include "lrdb/db/column_family.h"
+#include "lrdb/db/manifest.h"
 #include "lrdb/util/logging.h"
 #include "lrdb/background/background_manager.h"
 #include "lrdb/concurrency/tx_manager.h"
@@ -337,33 +338,47 @@ Status DBImpl::Close() {
     LOG_INFO << "Starting database shutdown for: " << dbname_;
     
     try {
-        // 1. 停止所有后台任务
-        if (components_) {
-            if (components_->background_manager) {
-                Status bg_status = components_->background_manager->Shutdown();
-                if (!bg_status.ok()) {
-                    LOG_WARN << "Background manager shutdown failed: " << bg_status.ToString();
-                }
-            }
-            
-            if (components_->cf_manager) {
-                Status cf_status = components_->cf_manager->Shutdown();
-                if (!cf_status.ok()) {
-                    LOG_WARN << "Column family manager shutdown failed: " << cf_status.ToString();
-                }
+        // 1. 停止所有后台任务（不再接受新的调度）
+        if (components_ && components_->background_manager) {
+            Status bg_status = components_->background_manager->Shutdown();
+            if (!bg_status.ok()) {
+                LOG_WARN << "Background manager shutdown failed: " << bg_status.ToString();
             }
         }
-        
-        // 2. 同步所有未刷盘的数据
+
+        // 2. 同步所有未刷盘的数据（MVCC刷回 + MemTable落盘）
         Status sync_status = SyncAllData();
         if (!sync_status.ok()) {
             LOG_ERROR << "Failed to sync data during shutdown: " << sync_status.ToString();
             // 继续关闭流程，但不创建清洁关闭标记
         } else {
-            // 3. 创建清洁关闭标记
+            // 3. 数据已全部落盘到SSTable，清空WAL（避免重开时重复重放）
+            if (components_ && components_->cf_manager) {
+                auto cf_list = components_->cf_manager->ListColumnFamilies();
+                for (const auto& cf_name : cf_list) {
+                    ColumnFamily* cf = components_->cf_manager->GetColumnFamily(cf_name);
+                    if (cf && cf->GetTxManager() && cf->GetTxManager()->wal()) {
+                        Status truncate_status = cf->GetTxManager()->wal()->TruncateLogs();
+                        if (!truncate_status.ok()) {
+                            LOG_WARN << "Failed to truncate WAL for column family " << cf_name
+                                     << ": " << truncate_status.ToString();
+                        }
+                    }
+                }
+            }
+
+            // 4. 创建清洁关闭标记
             Status marker_status = CreateCleanShutdownMarker();
             if (!marker_status.ok()) {
                 LOG_WARN << "Failed to create clean shutdown marker: " << marker_status.ToString();
+            }
+        }
+
+        // 5. 关闭列族管理器（内部会关闭各列族组件）
+        if (components_ && components_->cf_manager) {
+            Status cf_status = components_->cf_manager->Shutdown();
+            if (!cf_status.ok()) {
+                LOG_WARN << "Column family manager shutdown failed: " << cf_status.ToString();
             }
         }
         
@@ -516,11 +531,15 @@ Status DBImpl::SetupColumnFamilies() {
     if (!components_ || !components_->cf_manager) {
         return Status::InvalidArgument("ColumnFamilyManager not initialized");
     }
-    
+
     LOG_INFO << "Setting up column families";
-    
-    // 创建默认列族
-    return components_->cf_manager->CreateDefaultColumnFamily();
+
+    // 默认列族已在ColumnFamilyManager初始化时创建（或从MANIFEST恢复），
+    // 这里只有确实缺失时才创建，避免覆盖已恢复的实例
+    if (components_->cf_manager->GetColumnFamily("default") == nullptr) {
+        return components_->cf_manager->CreateDefaultColumnFamily();
+    }
+    return Status::OK();
 }
 
 Status DBImpl::RecoverFromCrash() {
@@ -623,25 +642,33 @@ Status DBImpl::RegisterUnifiedBackgroundTasks() {
 
     auto* bg = components_->background_manager.get();
 
-    // 刷回任务（MVCC -> LSM）
+    // 刷回任务（MVCC -> LSM）：覆盖所有列族
     BackgroundTask flush_task = CreatePeriodicTask(
         TaskType::kMaintenance,
         [this]() -> Status {
-            ColumnFamily* default_cf = this->DefaultColumnFamily();
-            if (!default_cf || !default_cf->GetTxManager()) return Status::OK();
-            return default_cf->GetTxManager()->FlushCommittedToLSM(options_.mvcc_flush_max_items);
+            auto cf_list = components_->cf_manager->ListColumnFamilies();
+            for (const auto& cf_name : cf_list) {
+                ColumnFamily* cf = components_->cf_manager->GetColumnFamily(cf_name);
+                if (!cf || !cf->GetTxManager()) continue;
+                Status s = cf->GetTxManager()->FlushCommittedToLSM(options_.mvcc_flush_max_items);
+                if (!s.ok()) return s;
+            }
+            return Status::OK();
         },
         std::chrono::milliseconds(options_.lsm_flush_check_interval_ms),
         TaskPriority::kNormal
     );
     bg->SchedulePeriodicTask(flush_task);
 
-    // GC 任务
+    // GC 任务：覆盖所有列族
     BackgroundTask gc_task = CreatePeriodicTask(
         TaskType::kMaintenance,
         [this]() -> Status {
-            ColumnFamily* default_cf = this->DefaultColumnFamily();
-            if (default_cf && default_cf->GetTxManager()) default_cf->GetTxManager()->RunGC();
+            auto cf_list = components_->cf_manager->ListColumnFamilies();
+            for (const auto& cf_name : cf_list) {
+                ColumnFamily* cf = components_->cf_manager->GetColumnFamily(cf_name);
+                if (cf && cf->GetTxManager()) cf->GetTxManager()->RunGC();
+            }
             return Status::OK();
         },
         std::chrono::milliseconds(options_.mvcc_version_cleanup_interval_ms),
@@ -894,12 +921,10 @@ Status DBImpl::RecoverFromWAL(SequenceNumber* recovered_sequence) {
             return Status::InvalidArgument("WAL manager not available");
         }
         
-        // 执行WAL恢复
-        Status wal_status = wal_manager->RecoverFromWAL(recovered_sequence);
-        if (!wal_status.ok()) {
-            return Status::IOError("WAL recovery failed: " + wal_status.ToString());
-        }
-        
+        // WAL记录已在列族构建阶段（WALManager::Initialize）重放到LSMTree，
+        // 这里只汇总恢复出的最大序列号，避免重复应用
+        *recovered_sequence = wal_manager->GetLastSequence();
+
         // 推进快照序列生成器，确保后续提交使用的 SnapshotSeq 不落后
         if (tx_manager) {
             tx_manager->RecoverSetSnapshot(*recovered_sequence);
@@ -1105,17 +1130,34 @@ Status DBImpl::SyncAllData() {
             if (!cf) {
                 continue;
             }
-            
+
+            // 先把MVCC版本链中已提交未刷回的数据写入LSMTree
+            auto* tx_manager = cf->GetTxManager();
+            if (tx_manager) {
+                // 循环直到版本链清空（每次最多刷max_items条）
+                for (int round = 0; round < 10000; ++round) {
+                    Status mvcc_flush_status =
+                        tx_manager->FlushCommittedToLSM(options_.mvcc_flush_max_items);
+                    if (!mvcc_flush_status.ok()) {
+                        LOG_ERROR << "Failed to flush MVCC data for column family " << cf_name
+                                 << ": " << mvcc_flush_status.ToString();
+                        return mvcc_flush_status;
+                    }
+                    if (tx_manager->version_chain()->PickCommittedNotFlushed(1).empty()) {
+                        break;
+                    }
+                }
+            }
+
             // 刷盘列族数据
             Status flush_status = cf->Flush();
             if (!flush_status.ok()) {
-                LOG_ERROR << "Failed to flush column family " << cf_name 
+                LOG_ERROR << "Failed to flush column family " << cf_name
                          << ": " << flush_status.ToString();
                 return flush_status;
             }
             
             // 同步WAL（新事务层）
-            auto* tx_manager = cf->GetTxManager();
             if (tx_manager) {
                 auto* wal_manager = tx_manager->wal();
                 if (wal_manager) {
@@ -1259,30 +1301,144 @@ Status DB::Open(const DBOptions& db_options, const std::string& name,
                  const std::vector<ColumnFamilyDescriptor>& column_families,
                  std::vector<ColumnFamily*>* handles,
                  std::unique_ptr<DB>* dbptr) {
-    (void)column_families; (void)handles;
-    return Open(db_options, name, dbptr);
+    if (!dbptr || !handles) {
+        return Status::InvalidArgument("dbptr or handles is null");
+    }
+
+    Status s = Open(db_options, name, dbptr);
+    if (!s.ok()) {
+        return s;
+    }
+
+    handles->clear();
+    handles->reserve(column_families.size());
+
+    // 默认列族已在Open时自动创建，其余描述符按需创建
+    for (const auto& desc : column_families) {
+        ColumnFamily* handle = (*dbptr)->DefaultColumnFamily();
+        if (desc.name != "default") {
+            s = (*dbptr)->CreateColumnFamily(desc.options, desc.name, &handle);
+            if (!s.ok()) {
+                return s;
+            }
+        }
+        handles->push_back(handle);
+    }
+
+    return Status::OK();
 }
 
 Status DB::OpenForReadOnly(const DBOptions& db_options, const std::string& name,
                            std::unique_ptr<DB>* dbptr, bool error_if_wal_file_exists) {
-    (void)error_if_wal_file_exists;
+    if (error_if_wal_file_exists && std::filesystem::exists(name)) {
+        // 存在未回放的WAL文件时拒绝以只读方式打开，避免读到陈旧数据
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(name)) {
+            if (!entry.is_regular_file()) continue;
+            std::string filename = entry.path().filename().string();
+            size_t dot = filename.rfind('.');
+            if (dot != std::string::npos && filename.substr(dot) == ".wal") {
+                return Status::IOError("WAL file exists, cannot open for read-only: " +
+                                       entry.path().string());
+            }
+        }
+    }
     return Open(db_options, name, dbptr);
 }
 
 Status DB::ListColumnFamilies(const DBOptions& db_options, const std::string& name,
                               std::vector<std::string>* column_families) {
-    (void)db_options; (void)name; (void)column_families;
-    return Status::NotSupported("ListColumnFamilies not implemented");
+    (void)db_options;
+    if (!column_families) {
+        return Status::InvalidArgument("column_families is null");
+    }
+
+    if (!std::filesystem::exists(name)) {
+        return Status::NotFound("Database directory does not exist: " + name);
+    }
+
+    column_families->clear();
+
+    // 只读方式解析MANIFEST，不打开数据库
+    auto manifest_manager = manifest_util::CreateManifestManager(name);
+    Status s = manifest_manager->Initialize();
+    if (!s.ok()) {
+        return s;
+    }
+
+    std::vector<ColumnFamilyDescriptor> cf_descriptors;
+    uint64_t last_sequence = 0;
+    s = manifest_manager->RecoverColumnFamilies(&cf_descriptors, &last_sequence);
+    manifest_manager->Shutdown();
+    if (!s.ok()) {
+        return s;
+    }
+
+    for (const auto& desc : cf_descriptors) {
+        if (!desc.is_dropped) {
+            column_families->push_back(desc.name);
+        }
+    }
+
+    // 没有任何MANIFEST记录的数据库视为只有默认列族
+    if (column_families->empty()) {
+        column_families->push_back("default");
+    }
+
+    return Status::OK();
 }
 
 Status DB::DestroyDB(const std::string& name, const DBOptions& options) {
-    (void)name; (void)options;
-    return Status::NotSupported("DestroyDB not implemented");
+    (void)options;
+    if (name.empty()) {
+        return Status::InvalidArgument("Database name is empty");
+    }
+
+    std::error_code ec;
+    if (std::filesystem::exists(name)) {
+        if (!std::filesystem::remove_all(name, ec) || ec) {
+            return Status::IOError("Failed to destroy database: " + ec.message());
+        }
+    }
+
+    return Status::OK();
 }
 
 Status DB::RepairDB(const std::string& dbname, const DBOptions& options) {
-    (void)dbname; (void)options;
-    return Status::NotSupported("RepairDB not implemented");
+    if (dbname.empty()) {
+        return Status::InvalidArgument("Database name is empty");
+    }
+
+    if (!std::filesystem::exists(dbname)) {
+        return Status::NotFound("Database directory does not exist: " + dbname);
+    }
+
+    // 清除上一次异常中断留下的恢复标记，避免打开时误判
+    std::error_code ec;
+    std::filesystem::remove(dbname + "/RECOVERY_IN_PROGRESS", ec);
+    std::filesystem::remove(dbname + "/CLEAN_SHUTDOWN", ec);
+
+    // 清理损坏文件标记（WAL恢复过程中重命名的.corrupted文件）
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(dbname)) {
+        if (!entry.is_regular_file()) continue;
+        std::string filename = entry.path().filename().string();
+        size_t dot = filename.rfind('.');
+        if (dot != std::string::npos && filename.substr(dot) == ".corrupted") {
+            std::filesystem::remove(entry.path(), ec);
+        }
+    }
+
+    // 打开并关闭一次，触发WAL回放与MemTable刷盘，重建一致状态
+    std::unique_ptr<DB> db;
+    Status s = Open(options, dbname, &db);
+    if (!s.ok()) {
+        return Status::IOError("Repair open failed: " + s.ToString());
+    }
+    s = db->Close();
+    if (!s.ok()) {
+        return Status::IOError("Repair close failed: " + s.ToString());
+    }
+
+    return Status::OK();
 }
 
 // ============================================================================
