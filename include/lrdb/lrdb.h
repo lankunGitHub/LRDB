@@ -56,7 +56,7 @@ struct Version {
     }
     
     static std::string GetFullVersionString() {
-        return "LRDB " + GetVersionString() + " (C++17, Linux, Reconstructed)";
+        return "LRDB " + GetVersionString() + " (C++17, Linux)";
     }
     
     static int GetVersionNumber() {

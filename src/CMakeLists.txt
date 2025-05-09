@@ -2,6 +2,7 @@
 set(LRDB_SOURCES
     # Core components
     core/coding.cc
+    core/lrdb.cc
     
     # Utility components
     util/bloom_filter.cc
