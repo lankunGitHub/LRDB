@@ -13,6 +13,7 @@ include_directories(include)
 # Add subdirectories
 add_subdirectory(src)
 add_subdirectory(examples)
+add_subdirectory(test)
 
 # Export compile commands for IDE support
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
