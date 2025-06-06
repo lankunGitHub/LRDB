@@ -247,8 +247,9 @@ bool IndexEntry::Decode(const Slice &data) {
 // SSTableIterator 实现
 class SSTableIterator : public SSTableReader::Iterator {
 public:
-  SSTableIterator(SSTableReader *reader, uint64_t snapshot)
-      : reader_(reader), snapshot_(snapshot), valid_(false),
+  // 用 shared_ptr 持有 reader：即使缓存驱逐了该 reader，迭代器仍可安全使用
+  SSTableIterator(std::shared_ptr<SSTableReader> reader, uint64_t snapshot)
+      : reader_(std::move(reader)), snapshot_(snapshot), valid_(false),
         current_block_(-1) {}
 
   bool Valid() const override {
@@ -455,30 +456,26 @@ private:
     offset_cache_.clear();
     offset_cache_.reserve(kDefaultOffsetCacheReserve);
 
-    const char *data = block_data_.data();
     const size_t data_size = block_data_.size();
     size_t offset = 0;
 
     while (offset < data_size) {
       offset_cache_.push_back(offset);
 
-      // 解析记录格式：[key_length][key_data][value_length][value_data]
-      if (offset + 4 > data_size)
-        break;
-
-      uint32_t key_length = coding::DecodeFixed32(data + offset);
-      offset += 4;
-
-      if (offset + key_length + 4 > data_size)
-        break;
-      offset += key_length; // 跳过键
-
-      uint32_t value_length = coding::DecodeFixed32(data + offset);
-      offset += 4;
-
-      if (offset + value_length > data_size)
-        break;
-      offset += value_length; // 跳过值
+      // 记录格式与 ParseCurrentEntry 一致：
+      // [varint key_len][key_data][varint value_len][value_data]
+      // 必须用 varint 解析，DecodeFixed32 会把偏移算错
+      Slice input(block_data_.data() + offset, data_size - offset);
+      Slice key_slice, value_slice;
+      if (!coding::GetLengthPrefixedSlice(&input, &key_slice) ||
+          !coding::GetLengthPrefixedSlice(&input, &value_slice)) {
+        break; // 块尾不完整，停止建缓存
+      }
+      size_t consumed = (data_size - offset) - input.size();
+      if (consumed == 0) {
+        break; // 防御：避免死循环
+      }
+      offset += consumed;
     }
 
     // 紧缩内存：如果实际条目数小于预估，释放多余空间
@@ -524,7 +521,7 @@ private:
   }
 
 private:
-  SSTableReader *reader_;
+  std::shared_ptr<SSTableReader> reader_;
   uint64_t snapshot_;
   bool valid_;
   int current_block_;
@@ -561,7 +558,12 @@ SSTableReader::SSTableReader()
   LOG_DEBUG << "SSTableReader initialized with error recovery callbacks";
 }
 
-SSTableReader::~SSTableReader() = default;
+SSTableReader::~SSTableReader() {
+  // 注销错误恢复回调，避免单例注册表持有悬垂 this
+  ErrorRecoveryManager::Instance().UnregisterCleanupCallback("SSTable");
+  ErrorRecoveryManager::Instance().UnregisterRecoveryCallback(
+      ErrorType::CorruptionError);
+}
 
 Status SSTableReader::Open(const std::string &filename, Env *env,
                            const Comparator *comparator) {
@@ -697,7 +699,9 @@ Status SSTableReader::Get(const Slice &key, std::string *value, bool *found,
 
   if (best_found) {
     if (best_is_delete) {
-      *found = false; // 最新可见版本是删除标记
+      // 最新可见版本是删除标记：用 Deleted 状态区分"墓碑"与"未命中"，
+      // 阻止上层继续查更老的候选文件（L0 多文件重叠时旧值会复活）
+      return Status::Deleted("Key was deleted");
     } else {
       *found = true;
       if (value) {
@@ -717,7 +721,9 @@ SSTableReader::NewIterator(uint64_t snapshot) {
     return nullptr;
   }
 
-  return std::make_unique<SSTableIterator>(this, snapshot);
+  // 无主共享指针（空删除器）：不接管所有权，仅保证迭代器存活期间 reader 不被销毁
+  std::shared_ptr<SSTableReader> pin(this, [](SSTableReader *) {});
+  return std::make_unique<SSTableIterator>(std::move(pin), snapshot);
 }
 
 bool SSTableReader::MayContainKey(const Slice &key) {
@@ -781,8 +787,10 @@ Status SSTableReader::VerifyChecksum() {
       return Status::Corruption("Failed to decode block header");
     }
 
-    uint32_t actual_crc = hash_util::CRC32(
-        block_data.data() + BlockHeader::kHeaderSize, header.size);
+    // ReadDataBlock 返回的是剥离块头后的纯内容，
+    // 与写入端 WriteDataBlock 的 CRC32 计算范围一致（纯内容）
+    uint32_t actual_crc =
+        hash_util::CRC32(block_data.data(), block_data.size());
     if (actual_crc != header.crc32) {
       return Status::Corruption("Block checksum mismatch");
     }
@@ -1481,15 +1489,7 @@ Status SSTableWriter::WriteDataBlock() {
     return Status::OK();
   }
 
-  // 计算CRC32校验和
-  uint32_t crc32 = hash_util::CRC32(data_buffer_.data(), data_buffer_.size());
-
-  // 创建块头部
-  BlockHeader header;
-  header.type = BlockType::kDataBlock;
-  header.size = static_cast<uint32_t>(data_buffer_.size());
-  header.crc32 = crc32;
-  header.compression = 0; // 暂不支持压缩
+  // 计算CRC32校验和（校验和由 WriteBlockHeader 写入块头）
 
   // 写入块头部
   Status s = WriteBlockHeader(BlockType::kDataBlock, Slice(data_buffer_));
@@ -2315,8 +2315,8 @@ Status SSTableManager::UnregisterSSTable(uint64_t file_number) {
   // 从文件映射中移除
   file_meta_map_.erase(it);
 
-  // 从缓存中移除
-  EvictFromCache(file_number);
+  // 从缓存中移除（已持有 mutex_，直接擦除，避免 EvictFromCache 二次加锁自死锁）
+  reader_cache_.erase(file_number);
 
   return Status::OK();
 }
@@ -2335,12 +2335,19 @@ Status SSTableManager::Get(const Slice &key, std::string *value, bool *found,
       const auto &level_files = level_files_[level];
 
       if (level == 0) {
-        // L0层文件可能重叠，需要搜索所有可能包含键的文件（新文件优先）
-        for (auto it = level_files.rbegin(); it != level_files.rend(); ++it) {
-          if (it->KeyInRange(key, comparator_)) {
-            candidates.push_back(it->file_number);
+        // L0层文件可能重叠，需要搜索所有可能包含键的文件。
+        // level_files_ 的顺序是注册顺序/最小键顺序，并不等价于新旧顺序，
+        // 这里显式按文件号从新到旧排序，保证最新文件先被搜索
+        std::vector<uint64_t> l0_candidates;
+        for (const auto &meta : level_files) {
+          if (meta.KeyInRange(key, comparator_)) {
+            l0_candidates.push_back(meta.file_number);
           }
         }
+        std::sort(l0_candidates.begin(), l0_candidates.end(),
+                  std::greater<uint64_t>());
+        candidates.insert(candidates.end(), l0_candidates.begin(),
+                          l0_candidates.end());
       } else {
         // L1+层文件不重叠，可以使用二分查找
         auto it = std::lower_bound(
@@ -2359,7 +2366,7 @@ Status SSTableManager::Get(const Slice &key, std::string *value, bool *found,
 
   // 逐个打开读取器查找
   for (uint64_t file_number : candidates) {
-    SSTableReader *reader = GetReader(file_number);
+    std::shared_ptr<SSTableReader> reader = GetReader(file_number);
     if (!reader) {
       continue;
     }
@@ -2385,11 +2392,23 @@ Status SSTableManager::Get(const Slice &key, std::string *value, bool *found,
 
 // 层级迭代器实现
 SSTableManager::LevelIterator::LevelIterator(SSTableManager *manager,
-                                             SSTableLevel level)
+                                             SSTableLevel level,
+                                             uint64_t only_file)
     : manager_(manager), level_(level), current_file_(-1) {
 
   std::shared_lock<std::shared_mutex> lock(manager_->mutex_);
-  level_files_ = manager_->level_files_[static_cast<size_t>(level)];
+  const auto &all_files = manager_->level_files_[static_cast<size_t>(level)];
+  if (only_file == UINT64_MAX) {
+    level_files_ = all_files;
+  } else {
+    // 只保留指定文件：L0 每个文件一个迭代器，由归并迭代器统一排序
+    for (const auto &meta : all_files) {
+      if (meta.file_number == only_file) {
+        level_files_.push_back(meta);
+        break;
+      }
+    }
+  }
 }
 void SSTableManager::LevelIterator::SeekToFirst() {
   current_file_ = 0;
@@ -2490,7 +2509,8 @@ void SSTableManager::LevelIterator::LoadCurrentIterator() {
   }
 
   const SSTableMeta &meta = level_files_[current_file_];
-  SSTableReader *reader = manager_->GetReader(meta.file_number);
+  std::shared_ptr<SSTableReader> reader =
+      manager_->GetReader(meta.file_number);
   if (reader) {
     current_iter_ = reader->NewIterator();
   } else {
@@ -2499,8 +2519,8 @@ void SSTableManager::LevelIterator::LoadCurrentIterator() {
 }
 
 std::unique_ptr<SSTableManager::LevelIterator>
-SSTableManager::NewLevelIterator(SSTableLevel level) {
-  return std::make_unique<LevelIterator>(this, level);
+SSTableManager::NewLevelIterator(SSTableLevel level, uint64_t only_file) {
+  return std::make_unique<LevelIterator>(this, level, only_file);
 }
 
 std::vector<SSTableMeta>
@@ -2599,6 +2619,17 @@ Status SSTableManager::FlushMemTableToSSTable(const MemTable *memtable,
 Status
 SSTableManager::DeleteObsoleteFiles(const std::vector<uint64_t> &file_numbers) {
   for (uint64_t file_number : file_numbers) {
+    // 必须先取出物理文件名：UnregisterSSTable 会把元数据从 map 移除，
+    // 之后再查 file_meta_map_ 永远查不到，文件就永远删不掉
+    std::string filename;
+    {
+      std::shared_lock<std::shared_mutex> lock(mutex_);
+      auto it = file_meta_map_.find(file_number);
+      if (it != file_meta_map_.end()) {
+        filename = it->second.filename;
+      }
+    }
+
     // 从注册中移除
     Status s = UnregisterSSTable(file_number);
     if (!s.ok()) {
@@ -2607,9 +2638,8 @@ SSTableManager::DeleteObsoleteFiles(const std::vector<uint64_t> &file_numbers) {
     }
 
     // 删除物理文件
-    auto it = file_meta_map_.find(file_number);
-    if (it != file_meta_map_.end()) {
-      env_->DeleteFile(it->second.filename);
+    if (!filename.empty()) {
+      env_->DeleteFile(filename);
     }
   }
 
@@ -2692,7 +2722,8 @@ void SSTableManager::ClearCache() {
 }
 
 // 私有方法实现
-SSTableReader *SSTableManager::GetReader(uint64_t file_number) {
+std::shared_ptr<SSTableReader>
+SSTableManager::GetReader(uint64_t file_number) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
 
   // 检查缓存
@@ -2702,7 +2733,7 @@ SSTableReader *SSTableManager::GetReader(uint64_t file_number) {
     it->second.last_access_time =
         std::chrono::steady_clock::now().time_since_epoch().count();
     it->second.access_count++;
-    return it->second.reader.get();
+    return it->second.reader;
   }
 
   // 缓存未命中，加载读取器
@@ -2719,13 +2750,13 @@ SSTableReader *SSTableManager::GetReader(uint64_t file_number) {
 
   // 添加到缓存
   CacheEntry entry;
-  entry.reader.reset(reader);
+  entry.reader = std::shared_ptr<SSTableReader>(reader);
   entry.last_access_time =
       std::chrono::steady_clock::now().time_since_epoch().count();
   entry.access_count = 1;
   reader_cache_[file_number] = std::move(entry);
 
-  return reader_cache_[file_number].reader.get();
+  return reader_cache_[file_number].reader;
 }
 
 Status SSTableManager::LoadReader(uint64_t file_number,

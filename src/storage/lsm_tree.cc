@@ -88,8 +88,10 @@ Status LSMTree::Close() {
   while (memtable_manager_->NumImmutableMemTables() > 0) {
     Status flush_status = FlushOldestMemTable();
     if (!flush_status.ok()) {
-      // 记录错误但继续关闭
+      // 刷盘失败（如磁盘满）时 immutable 列表不会减少，
+      // 继续循环只会死循环，记录错误并退出
       s = flush_status;
+      break;
     }
   }
 
@@ -127,14 +129,68 @@ Status LSMTree::Put(const Slice &key, const Slice &value, uint64_t sequence) {
 
   std::unique_lock<std::mutex> write_lock(write_mutex_);
 
-  // 等待写入条件满足
+  // 等待写入条件满足（传入已持有的锁，避免二次加锁自死锁）
   if (write_status == WriteStatus::kSlowdown) {
-    Status wait_status = WaitForWriteCondition();
+    Status wait_status = WaitForWriteCondition(write_lock);
     if (!wait_status.ok()) {
       return wait_status;
     }
   }
 
+  return PutLocked(key, value, sequence);
+}
+
+Status LSMTree::Delete(const Slice &key, uint64_t sequence) {
+  if (!opened_) {
+    return Status::InvalidArgument("LSMTree not opened");
+  }
+
+  // 检查写入条件
+  WriteStatus write_status = CheckWriteConditions();
+  if (write_status == WriteStatus::kStop) {
+    return Status::IOError("Write stopped due to too many L0 files");
+  }
+
+  std::unique_lock<std::mutex> write_lock(write_mutex_);
+
+  // 等待写入条件满足
+  if (write_status == WriteStatus::kSlowdown) {
+    Status wait_status = WaitForWriteCondition(write_lock);
+    if (!wait_status.ok()) {
+      return wait_status;
+    }
+  }
+
+  return DeleteLocked(key, sequence);
+}
+
+Status LSMTree::Merge(const Slice &key, const Slice &value, uint64_t sequence) {
+  if (!opened_) {
+    return Status::InvalidArgument("LSMTree not opened");
+  }
+
+  // 检查写入条件
+  WriteStatus write_status = CheckWriteConditions();
+  if (write_status == WriteStatus::kStop) {
+    return Status::IOError("Write stopped due to too many L0 files");
+  }
+
+  std::unique_lock<std::mutex> write_lock(write_mutex_);
+
+  // 等待写入条件满足
+  if (write_status == WriteStatus::kSlowdown) {
+    Status wait_status = WaitForWriteCondition(write_lock);
+    if (!wait_status.ok()) {
+      return wait_status;
+    }
+  }
+
+  return MergeLocked(key, value, sequence);
+}
+
+// 已持 write_mutex_ 的写入实现（公共接口与批量恢复共用）
+Status LSMTree::PutLocked(const Slice &key, const Slice &value,
+                          uint64_t sequence) {
   // 获取序列号
   if (sequence == 0) {
     sequence = GetNextSequenceNumber();
@@ -160,19 +216,7 @@ Status LSMTree::Put(const Slice &key, const Slice &value, uint64_t sequence) {
   return s;
 }
 
-Status LSMTree::Delete(const Slice &key, uint64_t sequence) {
-  if (!opened_) {
-    return Status::InvalidArgument("LSMTree not opened");
-  }
-
-  // 检查写入条件
-  WriteStatus write_status = CheckWriteConditions();
-  if (write_status == WriteStatus::kStop) {
-    return Status::IOError("Write stopped due to too many L0 files");
-  }
-
-  std::unique_lock<std::mutex> write_lock(write_mutex_);
-
+Status LSMTree::DeleteLocked(const Slice &key, uint64_t sequence) {
   // 获取序列号
   if (sequence == 0) {
     sequence = GetNextSequenceNumber();
@@ -198,19 +242,8 @@ Status LSMTree::Delete(const Slice &key, uint64_t sequence) {
   return s;
 }
 
-Status LSMTree::Merge(const Slice &key, const Slice &value, uint64_t sequence) {
-  if (!opened_) {
-    return Status::InvalidArgument("LSMTree not opened");
-  }
-
-  // 检查写入条件
-  WriteStatus write_status = CheckWriteConditions();
-  if (write_status == WriteStatus::kStop) {
-    return Status::IOError("Write stopped due to too many L0 files");
-  }
-
-  std::unique_lock<std::mutex> write_lock(write_mutex_);
-
+Status LSMTree::MergeLocked(const Slice &key, const Slice &value,
+                            uint64_t sequence) {
   // 获取序列号
   if (sequence == 0) {
     sequence = GetNextSequenceNumber();
@@ -251,6 +284,10 @@ Status LSMTree::Get(const Slice &key, std::string *value, uint64_t snapshot) {
   // 首先在MemTable中查找
   bool found = false;
   Status s = GetFromMemTables(key, value, snapshot, &found);
+  // 墓碑（Deleted）直接终止查找：该键在当前快照下已被删除，不能回退到 SSTable 的旧值
+  if (s.IsDeleted()) {
+    return Status::NotFound("Key was deleted");
+  }
   // MemTable未命中（NotFound）需要继续查SSTable，只有真正的错误才提前返回
   if (!s.ok() && !s.IsNotFound() && !s.IsMergeInProgress()) {
     return s;
@@ -258,6 +295,9 @@ Status LSMTree::Get(const Slice &key, std::string *value, uint64_t snapshot) {
 
   // 然后在SSTable中查找
   s = GetFromSSTables(key, value, snapshot, &found);
+  if (s.IsDeleted()) {
+    return Status::NotFound("Key was deleted");
+  }
   if (!s.ok()) {
     return s;
   }
@@ -293,6 +333,34 @@ Status LSMTree::TriggerFlush() {
 
   // 执行刷盘
   return FlushOldestMemTable();
+}
+
+Status LSMTree::FlushAll() {
+  if (!opened_) {
+    return Status::InvalidArgument("LSMTree not opened");
+  }
+
+  std::unique_lock<std::mutex> write_lock(write_mutex_);
+
+  // 把非空 mutable 变为 immutable（TriggerFlush 对 mutable 是空操作，
+  // 只靠它刷盘，mutable 数据会一直留在内存里）
+  if (memtable_manager_->GetMutableMemTable() &&
+      !memtable_manager_->GetMutableMemTable()->Empty()) {
+    Status s = MakeMemTableImmutable();
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  // 逐个刷盘所有 immutable
+  while (memtable_manager_->NumImmutableMemTables() > 0) {
+    Status s = FlushOldestMemTable();
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  return Status::OK();
 }
 
 Status LSMTree::FlushOldestMemTable() {
@@ -631,8 +699,11 @@ void LSMTree::SetWriteLimit(bool slowdown, bool stop) {
 // ============================================================================
 
 Status LSMTree::InitializeComponents() {
-  // 创建MemTable管理器
+  // 创建MemTable管理器（用 options_ 里的配置填充，之前用默认值导致
+  // 上层设置的 memtable_size / max_memtables 完全不生效）
   MemTableOptions memtable_opts;
+  memtable_opts.write_buffer_size = options_.memtable_size;
+  memtable_opts.max_write_buffer_number = options_.max_memtables;
   memtable_manager_ =
       std::make_unique<MemTableManager>(comparator_, memtable_opts);
 
@@ -759,7 +830,18 @@ Status LSMTree::DoLevelCompaction(SSTableLevel level) {
     return result.status;
   }
 
-  // 删除输入文件
+  // 先注册压缩输出文件：不注册的话压缩产物对 Get/迭代器不可见，
+  // 随后再删除输入文件就会造成数据丢失
+  for (const auto &meta : result.output_metas) {
+    Status reg = sstable_manager_->RegisterSSTable(meta);
+    if (!reg.ok()) {
+      LOG_ERROR << "Failed to register compaction output (file_number="
+                << meta.file_number << "): " << reg.ToString();
+      return reg;
+    }
+  }
+
+  // 删除输入文件（输出已注册成功之后才安全）
   std::vector<uint64_t> obsolete_files;
   for (const std::string &filename : input_files) {
     // 从文件名解析文件编号（简化实现）
@@ -797,9 +879,33 @@ Status LSMTree::PickCompactionFiles(SSTableLevel level,
   }
 
   if (level == SSTableLevel::kLevel0) {
-    // L0层压缩：选择所有文件
+    // L0层压缩：选择所有文件，并把 L1 中与它们键范围重叠的文件一并纳入输入，
+    // 否则压缩产物与 L1 残留文件键重叠，查找会取到旧版本
+    std::string min_key, max_key;
     for (const auto &meta : level_files) {
       input_files->push_back(meta.filename);
+      if (min_key.empty() || comparator_->Compare(Slice(meta.smallest_key),
+                                                  Slice(min_key)) < 0) {
+        min_key = meta.smallest_key;
+      }
+      if (max_key.empty() || comparator_->Compare(Slice(meta.largest_key),
+                                                  Slice(max_key)) > 0) {
+        max_key = meta.largest_key;
+      }
+    }
+
+    if (!min_key.empty() && !max_key.empty()) {
+      auto l1_files =
+          sstable_manager_->GetLevelFiles(SSTableLevel::kLevel1);
+      for (const auto &meta : l1_files) {
+        // 区间重叠判断：[a,b] 与 [c,d] 重叠 <=> a<=d && c<=b
+        if (comparator_->Compare(Slice(meta.smallest_key), Slice(max_key)) <=
+                0 &&
+            comparator_->Compare(Slice(meta.largest_key), Slice(min_key)) >=
+                0) {
+          input_files->push_back(meta.filename);
+        }
+      }
     }
     *output_level = SSTableLevel::kLevel1;
   } else {
@@ -857,9 +963,9 @@ WriteStatus LSMTree::CheckWriteConditions() const {
   return WriteStatus::kOK;
 }
 
-Status LSMTree::WaitForWriteCondition() {
-  std::unique_lock<std::mutex> lock(write_mutex_);
-  write_cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+Status LSMTree::WaitForWriteCondition(std::unique_lock<std::mutex> &write_lock) {
+  // 复用调用方已持有的 write_mutex_（调用方保证已加锁），不能在此重新加锁
+  write_cv_.wait_for(write_lock, std::chrono::milliseconds(100), [this] {
     return CheckWriteConditions() == WriteStatus::kOK;
   });
 
@@ -883,7 +989,11 @@ Status LSMTree::GetFromMemTables(const Slice &key, std::string *value,
   if (mutable_table) {
     Status status;
     bool memtable_found = mutable_table->Get(key, value, &status, snapshot);
-    if (!status.ok()) {
+    // 墓碑（Deleted）直接向上传播终止查找；未命中（NotFound）继续查 immutable
+    if (status.IsDeleted()) {
+      return status;
+    }
+    if (!status.ok() && !status.IsNotFound() && !status.IsMergeInProgress()) {
       return status;
     }
     if (memtable_found) {
@@ -899,7 +1009,10 @@ Status LSMTree::GetFromMemTables(const Slice &key, std::string *value,
     MemTable *memtable = *it;
     Status status;
     bool memtable_found = memtable->Get(key, value, &status, snapshot);
-    if (!status.ok() && !status.IsMergeInProgress()) {
+    if (status.IsDeleted()) {
+      return status;
+    }
+    if (!status.ok() && !status.IsNotFound() && !status.IsMergeInProgress()) {
       return status;
     }
     if (memtable_found) {
@@ -913,7 +1026,14 @@ Status LSMTree::GetFromMemTables(const Slice &key, std::string *value,
 
 Status LSMTree::GetFromSSTables(const Slice &key, std::string *value,
                                 uint64_t snapshot, bool *found) {
-  return sstable_manager_->Get(key, value, found, snapshot);
+  // SSTableManager::Get 会无条件重置 *found，这里用局部变量承接，
+  // 避免覆盖 MemTable 已命中的结果
+  bool sstable_found = false;
+  Status s = sstable_manager_->Get(key, value, &sstable_found, snapshot);
+  if (s.ok() && sstable_found) {
+    *found = true;
+  }
+  return s;
 }
 
 // ============================================================================
@@ -923,6 +1043,11 @@ Status LSMTree::GetFromSSTables(const Slice &key, std::string *value,
 Status LSMTree::RegisterBackgroundTasks() {
   if (!bg_manager_) {
     return Status::OK(); // 如果没有后台管理器，就不注册任务
+  }
+
+  // 幂等注册：Open 与 FinishRecovery 都会调用这里，重复注册会产生多份同名任务
+  if (!background_task_ids_.empty()) {
+    UnregisterBackgroundTasks();
   }
 
   // 注册刷盘任务
@@ -1173,8 +1298,8 @@ Status LSMTree::TEST_CompactLevel0() {
 LSMTreeMergeIterator::LSMTreeMergeIterator(const LSMTree *lsm_tree,
                                            uint64_t snapshot)
     : lsm_tree_(lsm_tree), snapshot_(snapshot),
-      comparator_(lsm_tree->comparator_), current_memtable_index_(-1),
-      current_sstable_index_(-1), valid_(false) {
+      comparator_(lsm_tree->comparator_), direction_(Direction::kForward),
+      current_memtable_index_(-1), current_sstable_index_(-1), valid_(false) {
 
   // snapshot=0表示读取最新数据，直接传递。
   // 不能用next_sequence_number_替换：重开数据库后该计数器尚未推进，
@@ -1191,11 +1316,22 @@ LSMTreeMergeIterator::LSMTreeMergeIterator(const LSMTree *lsm_tree,
     memtable_iters_.push_back(memtable->NewIterator());
   }
 
-  // 创建各层级SSTable迭代器
-  auto level_stats = lsm_tree_->sstable_manager_->GetLevelStats();
-  for (const auto &stat : level_stats) {
-    if (stat.num_files == 0) continue;
-    auto level_iter = lsm_tree_->sstable_manager_->NewLevelIterator(stat.level);
+  // 创建各层级SSTable迭代器。
+  // L0 文件间键范围重叠且新旧文件没有整体大小关系，必须每个文件一个迭代器
+  // 交给归并排序；L1+ 层内文件不重叠，整层共用一个迭代器即可
+  auto level_files = lsm_tree_->sstable_manager_->GetLevelFiles(SSTableLevel::kLevel0);
+  for (auto it = level_files.rbegin(); it != level_files.rend(); ++it) {
+    auto file_iter = lsm_tree_->sstable_manager_->NewLevelIterator(
+        SSTableLevel::kLevel0, it->file_number);
+    if (file_iter) {
+      sstable_iters_.push_back(std::move(file_iter));
+    }
+  }
+
+  for (int level = static_cast<int>(SSTableLevel::kLevel1);
+       level <= static_cast<int>(SSTableLevel::kMaxLevel); ++level) {
+    SSTableLevel sst_level = static_cast<SSTableLevel>(level);
+    auto level_iter = lsm_tree_->sstable_manager_->NewLevelIterator(sst_level);
     if (level_iter) {
       sstable_iters_.push_back(std::move(level_iter));
     }
@@ -1233,18 +1369,17 @@ void LSMTreeMergeIterator::SeekToLast() {
 }
 
 void LSMTreeMergeIterator::Seek(const Slice &target) {
-  // MemTable迭代器按内部键寻址（最大序列号落在该用户键的第一个版本上）
-  std::string internal_target;
-  coding::PutInternalKey(&internal_target, target, UINT64_MAX, 0xFF);
+  // 两侧子迭代器都按用户键寻址（MemTableIterator::Seek 内部自行编码，
+  // 这里再传内部键会二次编码导致定位错位）
   for (auto &iter : memtable_iters_) {
-    iter->Seek(internal_target);
+    iter->Seek(target);
   }
 
-  // SSTable迭代器按用户键寻址（内部自行处理索引定位）
   for (auto &iter : sstable_iters_) {
     iter->Seek(target);
   }
 
+  direction_ = Direction::kForward;
   // 找到最小的键
   FindSmallest();
 }
@@ -1254,9 +1389,29 @@ void LSMTreeMergeIterator::Next() {
     return;
   }
 
-  // FindSmallest在返回前已把当前键的所有版本消费完毕，
-  // 各子迭代器都停在下一个键上，直接重新归并即可
-  FindSmallest();
+  std::string last_key = current_key_;
+
+  // 从反向遍历切回正向时，子迭代器可能停在 current_key_ 之前，
+  // 先重新锚定到当前键，FindSmallest 的消费逻辑会越过它
+  if (direction_ != Direction::kForward) {
+    for (auto &iter : memtable_iters_) {
+      iter->Seek(Slice(last_key));
+    }
+    for (auto &iter : sstable_iters_) {
+      iter->Seek(Slice(last_key));
+    }
+    direction_ = Direction::kForward;
+  }
+
+  // FindSmallest 可能再次选中 current_key_ 的残留版本（切换方向时），
+  // 循环直到输出严格大于 last_key 的键
+  while (true) {
+    FindSmallest();
+    if (!valid_) return;
+    if (comparator_->Compare(Slice(current_key_), Slice(last_key)) > 0) {
+      return;
+    }
+  }
 }
 
 void LSMTreeMergeIterator::Prev() {
@@ -1264,9 +1419,35 @@ void LSMTreeMergeIterator::Prev() {
     return;
   }
 
-  // FindLargest在返回前已把当前键的所有版本消费完毕，
-  // 各子迭代器都停在前一个键上，直接重新归并即可
-  FindLargest();
+  std::string last_key = current_key_;
+
+  // 从正向切到反向：每个子迭代器先 Seek 回当前键，再后退一步，
+  // 得到各自“最后一个 < last_key 的键”
+  if (direction_ != Direction::kReverse) {
+    for (auto &iter : memtable_iters_) {
+      iter->Seek(Slice(last_key));
+      if (iter->Valid()) {
+        iter->Prev();
+      }
+    }
+    for (auto &iter : sstable_iters_) {
+      iter->Seek(Slice(last_key));
+      if (iter->Valid()) {
+        iter->Prev();
+      }
+    }
+    direction_ = Direction::kReverse;
+  }
+
+  // 反向归并：循环直到输出严格小于 last_key 的键
+  // （FindLargest 可能选中 >= last_key 的键，例如锚定后残留的当前键版本）
+  while (true) {
+    FindLargest();
+    if (!valid_) return;
+    if (comparator_->Compare(Slice(current_key_), Slice(last_key)) < 0) {
+      return;
+    }
+  }
 }
 
 Slice LSMTreeMergeIterator::key() const {
@@ -1300,12 +1481,32 @@ Status LSMTreeMergeIterator::status() const {
   return Status::OK();
 }
 
-// 比较两个内部键：按字节序（用户键升序；同一用户键时旧版本在前）。
-// 内部键编码为[用户键+8字节(序列号<<8|类型)]，字节序天然满足该语义，
-// 且与SSTable内存储顺序一致，两个来源（MemTable/SSTable）可直接归并
+// 比较两个内部键：先比用户键（升序），同一用户键比序列号（降序，新版本在前），
+// 再比类型（升序）。内部键尾部的 8 字节是 (seq<<8|type) 的 little-endian 编码，
+// 直接字节序比较会按 type/低位序列号排序，语义完全错误，必须解析后比较
 int LSMTreeMergeIterator::CompareInternalKeys(const Slice &a,
                                               const Slice &b) const {
-  return a.compare(b);
+  Slice ua, ub;
+  uint64_t sa = 0, sb = 0;
+  uint8_t ta = 0, tb = 0;
+  bool ok_a = coding::ParseInternalKey(a, &ua, &sa, &ta);
+  bool ok_b = coding::ParseInternalKey(b, &ub, &sb, &tb);
+  if (!ok_a || !ok_b) {
+    // 解析失败时退化为字节序比较
+    return a.compare(b);
+  }
+  int cmp = comparator_->Compare(ua, ub);
+  if (cmp != 0) {
+    return cmp;
+  }
+  // 同用户键：序列号大的在前
+  if (sa != sb) {
+    return sa > sb ? -1 : 1;
+  }
+  if (ta != tb) {
+    return ta < tb ? -1 : 1;
+  }
+  return 0;
 }
 
 // 选择最佳子迭代器（返回-1表示没有有效子迭代器；通过is_sstable区分来源）
@@ -1322,6 +1523,8 @@ int LSMTreeMergeIterator::PickChild(bool prefer_newest, bool *is_sstable) {
       return;
     }
     int cmp = CompareInternalKeys(candidate_key, Slice(best_key));
+    // 同一用户键时 CompareInternalKeys 返回“序列号大的更小”，
+    // 所以两种方向下同键都会优先取最新版本
     if (prefer_newest ? cmp < 0 : cmp > 0) {
       best_index = index;
       *is_sstable = from_sstable;
@@ -1331,7 +1534,8 @@ int LSMTreeMergeIterator::PickChild(bool prefer_newest, bool *is_sstable) {
 
   for (int i = 0; i < static_cast<int>(memtable_iters_.size()); ++i) {
     if (memtable_iters_[i]->Valid()) {
-      consider(memtable_iters_[i]->key(), i, false);
+      // MemTable迭代器只暴露用户键，这里重新拼装成内部键参与比较
+      consider(GetChildInternalKey(false, i), i, false);
     }
   }
   for (int i = 0; i < static_cast<int>(sstable_iters_.size()); ++i) {
@@ -1356,9 +1560,7 @@ void LSMTreeMergeIterator::FindSmallest() {
     }
 
     // 取最佳键的用户键/序列号/类型
-    std::string best_internal = is_sstable
-                                    ? sstable_iters_[best]->key().ToString()
-                                    : memtable_iters_[best]->key().ToString();
+    std::string best_internal = GetChildInternalKey(is_sstable, best);
     Slice user_key;
     uint64_t seq;
     uint8_t type;
@@ -1371,20 +1573,33 @@ void LSMTreeMergeIterator::FindSmallest() {
 
     std::string best_user_key = user_key.ToString();
 
-    // 版本对快照不可见，跳过（snapshot_==0表示读取最新，全部可见）
-    if (snapshot_ != 0 && seq > snapshot_) {
-      if (is_sstable) sstable_iters_[best]->Next();
-      else memtable_iters_[best]->Next();
-      continue;
-    }
+    // 消费所有子迭代器中该用户键的全部版本，取对快照可见且序列号最大的版本。
+    // 同键版本的顺序不可依赖：MemTable 迭代器是新版本在前，SSTable 块内是
+    // 内部键字节序（与序列号无关），跨子迭代器也可能各自持有部分版本
+    std::string final_value;
+    bool final_is_delete = false;
+    bool have_visible = false;
+    uint64_t best_visible_seq = 0;
 
-    // 在best子迭代器内推进到该用户键的最后一个可见版本
-    // （子迭代器内部同键版本按序列号升序排列，越靠后越新）
-    std::string final_value =
-        is_sstable ? sstable_iters_[best]->value().ToString()
-                   : memtable_iters_[best]->value().ToString();
-    bool final_is_delete = (type == static_cast<uint8_t>(ValueType::kDeletion));
+    auto consider_version = [&](bool from_sstable, int index, uint64_t vseq,
+                                uint8_t vtype) {
+      if (snapshot_ != 0 && vseq > snapshot_) {
+        return; // 该版本对快照不可见
+      }
+      if (!have_visible || vseq > best_visible_seq) {
+        have_visible = true;
+        best_visible_seq = vseq;
+        final_value = from_sstable
+                          ? sstable_iters_[index]->value().ToString()
+                          : memtable_iters_[index]->value().ToString();
+        final_is_delete =
+            (vtype == static_cast<uint8_t>(ValueType::kDeletion));
+      }
+    };
 
+    consider_version(is_sstable, best, seq, type);
+
+    // 推进 best 子迭代器，消费其同键版本
     while (true) {
       bool advanced;
       if (is_sstable) {
@@ -1396,34 +1611,30 @@ void LSMTreeMergeIterator::FindSmallest() {
       }
       if (!advanced) break;
 
-      Slice next_key = is_sstable ? sstable_iters_[best]->key()
-                                  : memtable_iters_[best]->key();
+      std::string next_internal = GetChildInternalKey(is_sstable, best);
       Slice next_user;
       uint64_t next_seq;
       uint8_t next_type;
-      if (!coding::ParseInternalKey(next_key, &next_user, &next_seq, &next_type) ||
+      if (!coding::ParseInternalKey(next_internal, &next_user, &next_seq, &next_type) ||
           comparator_->Compare(next_user, Slice(best_user_key)) != 0) {
         break; // 已到下一个用户键
       }
-      if (snapshot_ != 0 && next_seq > snapshot_) {
-        continue; // 该版本对快照不可见
-      }
-      final_value = is_sstable ? sstable_iters_[best]->value().ToString()
-                               : memtable_iters_[best]->value().ToString();
-      final_is_delete = (next_type == static_cast<uint8_t>(ValueType::kDeletion));
+      consider_version(is_sstable, best, next_seq, next_type);
     }
 
-    // 其他子迭代器中同一用户键的更旧版本全部跳过
+    // 其他子迭代器中的同键版本同样消费并参与比较
     for (int i = 0; i < static_cast<int>(memtable_iters_.size()); ++i) {
       if (is_sstable || i != best) {
         while (memtable_iters_[i]->Valid()) {
+          std::string child_internal = GetChildInternalKey(false, i);
           Slice uk;
           uint64_t s;
           uint8_t t;
-          if (!coding::ParseInternalKey(memtable_iters_[i]->key(), &uk, &s, &t) ||
+          if (!coding::ParseInternalKey(child_internal, &uk, &s, &t) ||
               comparator_->Compare(uk, Slice(best_user_key)) != 0) {
             break;
           }
+          consider_version(false, i, s, t);
           memtable_iters_[i]->Next();
         }
       }
@@ -1438,13 +1649,14 @@ void LSMTreeMergeIterator::FindSmallest() {
               comparator_->Compare(uk, Slice(best_user_key)) != 0) {
             break;
           }
+          consider_version(true, i, s, t);
           sstable_iters_[i]->Next();
         }
       }
     }
 
-    // 删除标记：该键被删除，跳过并继续
-    if (final_is_delete) {
+    // 全部版本对快照不可见，或最新可见版本是删除标记：跳过该键
+    if (!have_visible || final_is_delete) {
       continue;
     }
 
@@ -1455,6 +1667,18 @@ void LSMTreeMergeIterator::FindSmallest() {
     valid_ = true;
     return;
   }
+}
+
+std::string LSMTreeMergeIterator::GetChildInternalKey(bool is_sstable,
+                                                      int index) const {
+  if (is_sstable) {
+    return sstable_iters_[index]->key().ToString();
+  }
+  // MemTable迭代器只暴露用户键，用sequence()/type()重新拼装内部键
+  return InternalKey(memtable_iters_[index]->key(),
+                     memtable_iters_[index]->sequence(),
+                     memtable_iters_[index]->type())
+      .Encode();
 }
 
 void LSMTreeMergeIterator::FindLargest() {
@@ -1469,9 +1693,7 @@ void LSMTreeMergeIterator::FindLargest() {
       return; // 没有更多键
     }
 
-    std::string best_internal = is_sstable
-                                    ? sstable_iters_[best]->key().ToString()
-                                    : memtable_iters_[best]->key().ToString();
+    std::string best_internal = GetChildInternalKey(is_sstable, best);
     Slice user_key;
     uint64_t seq;
     uint8_t type;
@@ -1483,64 +1705,65 @@ void LSMTreeMergeIterator::FindLargest() {
 
     std::string best_user_key = user_key.ToString();
 
-    // 向后遍历取该用户键最老的可见版本
-    bool found = false;
-    std::string candidate_value;
-    bool candidate_is_delete = false;
-    while (true) {
-      Slice cur_key;
-      if (is_sstable) {
-        if (!sstable_iters_[best]->Valid()) break;
-        cur_key = sstable_iters_[best]->key();
-      } else {
-        if (!memtable_iters_[best]->Valid()) break;
-        cur_key = memtable_iters_[best]->key();
-      }
-      Slice uk;
-      uint64_t s;
-      uint8_t t;
-      if (!coding::ParseInternalKey(cur_key, &uk, &s, &t) ||
-          comparator_->Compare(uk, Slice(best_user_key)) != 0) {
-        break;
-      }
-      if (snapshot_ == 0 || s <= snapshot_) {
-        found = true;
-        candidate_is_delete =
-            (t == static_cast<uint8_t>(ValueType::kDeletion));
-        candidate_value = is_sstable ? sstable_iters_[best]->value().ToString()
-                                     : memtable_iters_[best]->value().ToString();
-      }
-      if (is_sstable) sstable_iters_[best]->Next();
-      else memtable_iters_[best]->Next();
+    // 反向遍历时子迭代器可能停在同键的"字节序最后"版本上（Prev 锚定而来），
+    // 只向后消费会漏掉字节序更早但序列号更大的版本。
+    // 把所有子迭代器重新 Seek 到该用户键的第一个版本，再统一向前消费
+    for (auto &iter : memtable_iters_) {
+      iter->Seek(Slice(best_user_key));
+    }
+    for (auto &iter : sstable_iters_) {
+      iter->Seek(Slice(best_user_key));
     }
 
-    // 其他子迭代器中同一用户键的版本全部跳过（都已由本子迭代器覆盖）
+    // 与 FindSmallest 相同：消费所有子迭代器中该用户键的全部版本，
+    // 取对快照可见且序列号最大的版本（不能依赖子迭代器内部同键版本顺序）
+    std::string candidate_value;
+    bool candidate_is_delete = false;
+    bool found = false;
+    uint64_t best_visible_seq = 0;
+
+    auto consider_version = [&](bool from_sstable, int index, uint64_t vseq,
+                                uint8_t vtype) {
+      if (snapshot_ != 0 && vseq > snapshot_) {
+        return;
+      }
+      if (!found || vseq > best_visible_seq) {
+        found = true;
+        best_visible_seq = vseq;
+        candidate_is_delete =
+            (vtype == static_cast<uint8_t>(ValueType::kDeletion));
+        candidate_value = from_sstable
+                              ? sstable_iters_[index]->value().ToString()
+                              : memtable_iters_[index]->value().ToString();
+      }
+    };
+
+    // 消费所有子迭代器中该用户键的全部版本
     for (int i = 0; i < static_cast<int>(memtable_iters_.size()); ++i) {
-      if (is_sstable || i != best) {
-        while (memtable_iters_[i]->Valid()) {
-          Slice uk;
-          uint64_t s;
-          uint8_t t;
-          if (!coding::ParseInternalKey(memtable_iters_[i]->key(), &uk, &s, &t) ||
-              comparator_->Compare(uk, Slice(best_user_key)) != 0) {
-            break;
-          }
-          memtable_iters_[i]->Next();
+      while (memtable_iters_[i]->Valid()) {
+        std::string child_internal = GetChildInternalKey(false, i);
+        Slice uk;
+        uint64_t s;
+        uint8_t t;
+        if (!coding::ParseInternalKey(child_internal, &uk, &s, &t) ||
+            comparator_->Compare(uk, Slice(best_user_key)) != 0) {
+          break;
         }
+        consider_version(false, i, s, t);
+        memtable_iters_[i]->Next();
       }
     }
     for (int i = 0; i < static_cast<int>(sstable_iters_.size()); ++i) {
-      if (!is_sstable || i != best) {
-        while (sstable_iters_[i]->Valid()) {
-          Slice uk;
-          uint64_t s;
-          uint8_t t;
-          if (!coding::ParseInternalKey(sstable_iters_[i]->key(), &uk, &s, &t) ||
-              comparator_->Compare(uk, Slice(best_user_key)) != 0) {
-            break;
-          }
-          sstable_iters_[i]->Next();
+      while (sstable_iters_[i]->Valid()) {
+        Slice uk;
+        uint64_t s;
+        uint8_t t;
+        if (!coding::ParseInternalKey(sstable_iters_[i]->key(), &uk, &s, &t) ||
+            comparator_->Compare(uk, Slice(best_user_key)) != 0) {
+          break;
         }
+        consider_version(true, i, s, t);
+        sstable_iters_[i]->Next();
       }
     }
 
@@ -1558,7 +1781,7 @@ void LSMTreeMergeIterator::FindLargest() {
 
 void LSMTreeMergeIterator::ClearChildren() {
   memtable_iters_.clear();
-  // 简化：暂时没有sstable_iters_
+  sstable_iters_.clear();
 }
 
 // ============================================================================
@@ -1662,12 +1885,14 @@ LSMTree::BatchRecoverFromWAL(const std::vector<WALRecordForRecovery> &records) {
     for (const auto &record : records) {
       Slice key_slice(record.key);
 
+      // 这里已持有 write_mutex_，必须用 Locked 内部实现，
+      // 否则 Put/Delete 会二次加锁自死锁
       Status s;
       if (record.is_deletion) {
-        s = Delete(key_slice, record.sequence);
+        s = DeleteLocked(key_slice, record.sequence);
       } else {
         Slice value_slice(record.value);
-        s = Put(key_slice, value_slice, record.sequence);
+        s = PutLocked(key_slice, value_slice, record.sequence);
       }
 
       if (!s.ok()) {
@@ -1738,14 +1963,16 @@ Status LSMTree::FinishRecovery(uint64_t final_sequence) {
     // 2. 退出恢复模式
     in_recovery_mode_.store(false);
 
-    // 3. 恢复缓冲非空时刷盘为L0 SSTable（WAL重放的记录在这里）
+    // 3. 恢复缓冲非空时刷盘为L0 SSTable（WAL重放的记录在这里）。
+    // 刷盘失败不能丢弃缓冲：WAL 文件还在，必须报错让上层保留 WAL 供下次重试
     if (current_memtable_ && !current_memtable_->Empty()) {
       SSTableMeta recovery_meta;
       Status recovery_flush = sstable_manager_->FlushMemTableToSSTable(
           current_memtable_.get(), SSTableLevel::kLevel0, &recovery_meta);
       if (!recovery_flush.ok()) {
-        LOG_WARN << "Failed to flush recovered data to SSTable: "
-                 << recovery_flush.ToString();
+        LOG_ERROR << "Failed to flush recovered data to SSTable: "
+                  << recovery_flush.ToString();
+        return recovery_flush;
       }
       current_memtable_.reset();
     }

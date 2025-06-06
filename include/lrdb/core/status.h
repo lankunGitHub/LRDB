@@ -5,7 +5,6 @@
 #include <iostream>
 #include <memory>
 #include <string>
-#include <string_view>
 
 namespace lrdb {
 
@@ -27,7 +26,9 @@ enum class StatusCode : int {
   kTryAgain = 13,
   kCompactionTooLarge = 14,
   kColumnFamilyDropped = 15,
-  kMaxCode = 16
+  // 内部信号：读到可见的删除标记（墓碑），用于阻断向更老层的回退查找
+  kDeleted = 16,
+  kMaxCode = 17
 };
 
 // 状态类 - 完整头文件实现
@@ -39,12 +40,6 @@ public:
   Status(StatusCode code) noexcept : code_(code), message_(nullptr) {}
 
   Status(StatusCode code, const std::string &msg) : code_(code) {
-    if (!msg.empty()) {
-      message_ = std::make_unique<std::string>(msg);
-    }
-  }
-
-  Status(StatusCode code, std::string_view msg) : code_(code) {
     if (!msg.empty()) {
       message_ = std::make_unique<std::string>(msg);
     }
@@ -117,6 +112,7 @@ public:
   bool IsBusy() const noexcept { return code_ == StatusCode::kBusy; }
   bool IsExpired() const noexcept { return code_ == StatusCode::kExpired; }
   bool IsTryAgain() const noexcept { return code_ == StatusCode::kTryAgain; }
+  bool IsDeleted() const noexcept { return code_ == StatusCode::kDeleted; }
 
   // 获取信息
   StatusCode code() const noexcept { return code_; }
@@ -207,6 +203,10 @@ public:
     return Status(StatusCode::kTryAgain, msg);
   }
 
+  static Status Deleted(const std::string &msg = "") {
+    return Status(StatusCode::kDeleted, msg);
+  }
+
 private:
   StatusCode code_;
   std::unique_ptr<std::string> message_;
@@ -225,6 +225,7 @@ private:
     static const std::string kBusyMessage = "Busy";
     static const std::string kExpiredMessage = "Expired";
     static const std::string kTryAgainMessage = "TryAgain";
+    static const std::string kDeletedMessage = "Deleted";
     static const std::string kUnknownMessage = "Unknown";
 
     switch (code_) {
@@ -254,6 +255,8 @@ private:
       return kExpiredMessage;
     case StatusCode::kTryAgain:
       return kTryAgainMessage;
+    case StatusCode::kDeleted:
+      return kDeletedMessage;
     default:
       return kUnknownMessage;
     }
@@ -295,6 +298,8 @@ inline std::ostream &operator<<(std::ostream &os, StatusCode code) {
     return os << "CompactionTooLarge";
   case StatusCode::kColumnFamilyDropped:
     return os << "ColumnFamilyDropped";
+  case StatusCode::kDeleted:
+    return os << "Deleted";
   default:
     return os << "Unknown(" << static_cast<int>(code) << ")";
   }

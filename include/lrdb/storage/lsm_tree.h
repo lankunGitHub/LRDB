@@ -187,7 +187,11 @@ public:
   // ============================================================================
 
   // MemTable刷盘API
-  Status TriggerFlush();        // 触发刷盘检查
+  Status TriggerFlush();
+
+  // 把非空 mutable 也变为 immutable 并全部刷盘（干净关闭用）。
+  // TriggerFlush 只刷 immutable，对 mutable 是空操作
+  Status FlushAll();        // 触发刷盘检查
   Status FlushOldestMemTable(); // 刷盘最老的immutable MemTable
   bool NeedsFlush() const;      // 是否需要刷盘
 
@@ -297,11 +301,16 @@ private:
   // 检查写入条件
   WriteStatus CheckWriteConditions() const;
 
-  // 等待写入条件满足
-  Status WaitForWriteCondition();
+  // 等待写入条件满足（复用调用方已持有的 write_mutex_，避免自我死锁）
+  Status WaitForWriteCondition(std::unique_lock<std::mutex> &write_lock);
 
   // 更新序列号
   uint64_t GetNextSequenceNumber();
+
+  // 已持 write_mutex_ 的写入内部实现（公共 Put/Delete/Merge 与批量恢复共用）
+  Status PutLocked(const Slice &key, const Slice &value, uint64_t sequence);
+  Status DeleteLocked(const Slice &key, uint64_t sequence);
+  Status MergeLocked(const Slice &key, const Slice &value, uint64_t sequence);
 
   // ============================================================================
   // 读取优化
@@ -430,15 +439,22 @@ private:
   void FindLargest();
   void ClearChildren();
 
-  // 内部键比较：用户键升序，同键新版本（大序列号）在前
+  // 内部键比较：用户键升序（方向由调用方决定），同键新版本（大序列号）在前
   int CompareInternalKeys(const Slice &a, const Slice &b) const;
-  // 选择最佳子迭代器（prefer_newest=true取最小，false取最大）
+  // 选择最佳子迭代器（prefer_newest=true取最小用户键，false取最大用户键；
+  // 同一用户键永远取序列号最大的版本）
   int PickChild(bool prefer_newest, bool *is_sstable);
+  // 获取子迭代器当前键的内部键编码（memtable迭代器只暴露用户键，需重新拼装）
+  std::string GetChildInternalKey(bool is_sstable, int index) const;
 
 private:
   const LSMTree *lsm_tree_;
   uint64_t snapshot_;
   const Comparator *comparator_;
+
+  // 遍历方向（反向遍历与正向遍历混用时需要重新锚定子迭代器）
+  enum class Direction { kForward, kReverse };
+  Direction direction_;
 
   // 子迭代器：MemTable迭代器 + SSTable层级迭代器
   std::vector<std::unique_ptr<MemTable::Iterator>> memtable_iters_;

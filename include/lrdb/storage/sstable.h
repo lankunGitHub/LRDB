@@ -520,7 +520,11 @@ public:
   // 创建层级迭代器
   class LevelIterator {
   public:
-    LevelIterator(SSTableManager *manager, SSTableLevel level);
+    // only_file：只迭代指定文件号（UINT64_MAX 表示整个层级）。
+    // L0 文件间键范围重叠，归并迭代器对每个 L0 文件各建一个迭代器，
+    // 由上层统一排序，避免单文件串接破坏全序
+    LevelIterator(SSTableManager *manager, SSTableLevel level,
+                  uint64_t only_file = UINT64_MAX);
 
     void SeekToFirst();
     void SeekToLast();
@@ -542,7 +546,9 @@ public:
     std::unique_ptr<SSTableReader::Iterator> current_iter_;
   };
 
-  std::unique_ptr<LevelIterator> NewLevelIterator(SSTableLevel level);
+  std::unique_ptr<LevelIterator> NewLevelIterator(SSTableLevel level,
+                                                  uint64_t only_file =
+                                                      UINT64_MAX);
 
   // 获取层级文件列表
   std::vector<SSTableMeta> GetLevelFiles(SSTableLevel level) const;
@@ -587,7 +593,8 @@ public:
 
 private:
   // 内部方法
-  SSTableReader *GetReader(uint64_t file_number);
+  // 返回共享指针：调用方/迭代器持有一份引用，缓存驱逐不会销毁仍在使用的 reader
+  std::shared_ptr<SSTableReader> GetReader(uint64_t file_number);
   Status LoadReader(uint64_t file_number, SSTableReader **reader);
   void EvictLRUReader();
 
@@ -603,9 +610,10 @@ private:
   std::vector<std::vector<SSTableMeta>> level_files_;
   std::unordered_map<uint64_t, SSTableMeta> file_meta_map_;
 
-  // 读取器缓存（LRU）
+  // 读取器缓存（LRU）。用 shared_ptr 持有：驱逐只从缓存摘除，
+  // 仍被迭代器/Get 引用的 reader 不会悬垂
   struct CacheEntry {
-    std::unique_ptr<SSTableReader> reader;
+    std::shared_ptr<SSTableReader> reader;
     uint64_t last_access_time;
     size_t access_count;
   };

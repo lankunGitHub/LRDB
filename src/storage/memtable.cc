@@ -228,6 +228,12 @@ MemTable::MemTable(const Comparator *comparator, const MemTableOptions &options)
 }
 
 MemTable::~MemTable() {
+  // 注销错误恢复回调：注册表是进程级单例，不注销会在析构后
+  // 以悬垂 this 调用恢复逻辑（use-after-free）
+  ErrorRecoveryManager::Instance().UnregisterCleanupCallback("MemTable");
+  ErrorRecoveryManager::Instance().UnregisterRecoveryCallback(
+      ErrorType::MemoryError);
+
   // 清理所有条目
   entries_.clear();
 }
@@ -359,7 +365,9 @@ bool MemTable::Get(const Slice &key, std::string *value, Status *status,
             *status = Status::OK();
             return true;
           } else {
-            *status = Status::NotFound("Key was deleted");
+            // 用独立的 Deleted 状态区分"墓碑"与"未命中"，
+            // 让上层 LSMTree::Get 能阻断继续向 SSTable 查找
+            *status = Status::Deleted("Key was deleted");
           }
         }
         return false;
