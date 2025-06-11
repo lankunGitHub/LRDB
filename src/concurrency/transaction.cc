@@ -25,7 +25,22 @@ TransactionImpl::TransactionImpl(TxManager* mgr,
       lock_mgr_(lock_mgr), vcm_(vcm), wal_(wal), lsm_(lsm), cmp_(cmp) {}
 
 TransactionImpl::~TransactionImpl() {
+    // 未 Commit/Rollback 就被销毁的事务视为中止：
+    // 标记其 Active 版本为 Aborted 并移出活跃事务集，防止活跃集泄漏
+    if (!finished_ && mgr_ && txn_id_ != 0) {
+        if (vcm_) vcm_->MarkTransactionAborted(txn_id_);
+        mgr_->OnAborted(txn_id_);
+    }
     if (lock_mgr_) lock_mgr_->ReleaseAll(txn_id_);
+}
+
+SnapshotSequence TransactionImpl::LsmReadSeq() const {
+    // RC 语义：每次读都应看到当时最新的已提交数据；
+    // RR/只读事务：使用 Begin 时冻结的序列号保证重复读一致
+    if (view_.Policy() == ReadViewPolicy::kReadCommitted && mgr_) {
+        return mgr_->CurrentSnapshotSequence();
+    }
+    return lsm_read_seq_;
 }
 
 Status TransactionImpl::Put(const Slice& key, const Slice& value) {
@@ -54,6 +69,13 @@ Status TransactionImpl::Get(const Slice& key, std::string* value) {
     bool found = false;
     // 先看本事务或可见提交版本
     Status s = vcm_->GetVisible(key.ToString(), view_, &v, &found);
+    if (s.IsDeleted()) {
+        // 可见删除标记：键在当前视图下不存在，不再回退 LSM
+        if (opts_.enable_rr_validation) {
+            read_set_[key.ToString()] = ReadEntry{false, ""};
+        }
+        return Status::NotFound("Key was deleted");
+    }
     if (!s.ok()) return s;
     if (found) {
         *value = std::move(v);
@@ -63,9 +85,9 @@ Status TransactionImpl::Get(const Slice& key, std::string* value) {
         return Status::OK();
     }
 
-    // 再查 LSM（使用 lsm_read_seq_）
+    // 再查 LSM（RC 用读时刻序列号，RR 用 Begin 时冻结的序列号）
     if (!lsm_) return Status::NotFound("not found");
-    Status ls = lsm_->Get(key, value, lsm_read_seq_);
+    Status ls = lsm_->Get(key, value, LsmReadSeq());
     if (opts_.enable_rr_validation && ls.ok()) {
         read_set_[key.ToString()] = ReadEntry{true, *value};
     }
@@ -88,17 +110,22 @@ Status TransactionImpl::Commit(bool allocate_new_snapshot) {
             std::string cur;
             bool cur_found = false;
             Status s = vcm_->GetVisible(k, view_, &cur, &cur_found);
-            if (!s.ok()) return s;
+            if (s.IsDeleted()) {
+                cur_found = false; // 键当前已被删除
+            } else if (!s.ok()) {
+                return s;
+            }
             if (re.found != cur_found) return Status::Aborted("RR validation failed");
             if (re.found && cur != re.value) return Status::Aborted("RR validation failed");
         }
     }
     if (!wal_ || !vcm_) return Status::InvalidArgument("TX components missing");
+    if (!mgr_) return Status::InvalidArgument("TxManager missing");
 
     // 提交：由 TxManager 分配提交序号（可共享或递增）
     // 若调用方未显式指定，使用选项开关决定是否分配新快照
     bool use_new = allocate_new_snapshot || opts_.new_snapshot_on_commit;
-    SnapshotSequence commit_seq = mgr_ ? mgr_->PrepareCommit(txn_id_, use_new) : 0;
+    SnapshotSequence commit_seq = mgr_->PrepareCommit(txn_id_, use_new);
 
     // 将 touched_keys_ 的最新本事务 Active 记录写入 WAL（普通 Put/Delete）
     for (const auto& k : touched_keys_) {
@@ -111,18 +138,26 @@ Status TransactionImpl::Commit(bool allocate_new_snapshot) {
         } else {
             s = wal_->WritePut(mgr_->cf_id(), Slice(k), Slice(rec.value), commit_seq);
         }
-        if (!s.ok()) return s;
+        if (!s.ok()) {
+            // WAL 写入失败：提交无法持久化，回滚事务并释放锁
+            Abort();
+            return s;
+        }
     }
 
     // 同步 WAL
     Status sync_st = wal_->Sync();
-    if (!sync_st.ok()) return sync_st;
+    if (!sync_st.ok()) {
+        Abort();
+        return sync_st;
+    }
 
     // 标注提交（设置 commit_snapshot）并从活动事务集中移除
     vcm_->MarkTransactionCommitted(txn_id_, commit_seq);
-    if (mgr_) mgr_->OnCommitted(txn_id_);
+    mgr_->OnCommitted(txn_id_);
     if (lock_mgr_) lock_mgr_->ReleaseAll(txn_id_);
     touched_keys_.clear();
+    finished_ = true;
     return Status::OK();
 }
 
@@ -132,7 +167,17 @@ Status TransactionImpl::Rollback() {
     if (mgr_) mgr_->OnAborted(txn_id_);
     if (lock_mgr_) lock_mgr_->ReleaseAll(txn_id_);
     touched_keys_.clear();
+    finished_ = true;
     return Status::OK();
+}
+
+void TransactionImpl::Abort() {
+    // Commit 中途失败的回滚路径：与 Rollback 等价，但不要求调用方再处理
+    if (vcm_) vcm_->MarkTransactionAborted(txn_id_);
+    if (mgr_) mgr_->OnAborted(txn_id_);
+    if (lock_mgr_) lock_mgr_->ReleaseAll(txn_id_);
+    touched_keys_.clear();
+    finished_ = true;
 }
 
 // 事务可见迭代器：简化占位，后续实现为合并迭代器（MVCC链 + LSM）
@@ -178,6 +223,7 @@ public:
     }
     void SeekForPrev(const Slice& target) override {
         // 不支持，置为无效
+        (void)target;
         valid_ = false;
     }
     void Next() override {
@@ -205,7 +251,9 @@ private:
 
     int CompareKeys(const std::string& a, const std::string& b) const {
         if (!cmp_) {
-            if (a < b) return -1; if (a > b) return 1; return 0;
+            if (a < b) return -1;
+            if (a > b) return 1;
+            return 0;
         }
         return cmp_->Compare(Slice(a), Slice(b));
     }
@@ -282,7 +330,7 @@ std::unique_ptr<Iterator> TransactionImpl::NewIterator() {
     if (opts_.isolation == IsolationLevel::kSerializable && lock_mgr_) {
         (void)lock_mgr_->AcquireRange("", "", txn_id_, /*exclusive=*/false, opts_.lock_timeout);
     }
-    return std::make_unique<TxnIterator>(vcm_, view_, cmp_, lsm_, lsm_read_seq_);
+    return std::make_unique<TxnIterator>(vcm_, view_, cmp_, lsm_, LsmReadSeq());
 }
 
 } // namespace lrdb

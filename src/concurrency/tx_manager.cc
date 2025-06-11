@@ -79,6 +79,7 @@ Status TxManager::Get(const Slice& key, std::string* value) {
     std::string v;
     bool found = false;
     Status s = vcm_.GetVisible(key.ToString(), view, &v, &found);
+    // 可见删除标记原样向上传播（由列族层转换为 NotFound），不回退 LSM
     if (!s.ok()) return s;
     if (found) { *value = std::move(v); return Status::OK(); }
     if (!lsm_) return Status::NotFound("not found");
@@ -109,15 +110,9 @@ Status TxManager::FlushCommittedToLSM(size_t max_items) {
 }
 
 void TxManager::RunGC() {
-    // 基于最老活跃 ReadView 的安全边界进行 GC
-    std::vector<TransactionID> active;
-    TransactionID up_limit = 0;
-    {
-        std::shared_lock<std::shared_mutex> lk(mu_);
-        active.assign(active_txns_.begin(), active_txns_.end());
-        up_limit = txn_gen_.Current() + 1; // 下一可分配 txn_id 作为上界
-    }
-    vcm_.GarbageCollect(active, up_limit);
+    // 版本链 GC：清理 Aborted 与已落盘的老提交版本。
+    // 安全性由"所有提交版本最终落盘"保证，见 VersionChainManager::GarbageCollect 注释
+    vcm_.GarbageCollect();
 }
 
 

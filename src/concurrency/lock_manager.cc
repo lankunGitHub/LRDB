@@ -24,13 +24,18 @@ bool WaitForGraph::WouldCreateCycle(TransactionID waiter, TransactionID holder) 
 
     std::unordered_set<TransactionID> visited;
     std::unordered_set<TransactionID> stack;
-    return Dfs(waiter, waiter, visited, stack);
+    return Dfs(waiter, waiter, visited, stack, nullptr);
 }
 
 bool WaitForGraph::Dfs(TransactionID start, TransactionID cur,
                        std::unordered_set<TransactionID>& visited,
-                       std::unordered_set<TransactionID>& stack) const {
-    if (stack.count(cur)) return true;
+                       std::unordered_set<TransactionID>& stack,
+                       std::unordered_set<TransactionID>* cycle_out) const {
+    if (stack.count(cur)) {
+        // 当前 DFS 路径即构成环，记录下来用于选择牺牲者
+        if (cycle_out) *cycle_out = stack;
+        return true;
+    }
     if (visited.count(cur)) return false;
     visited.insert(cur);
     stack.insert(cur);
@@ -38,7 +43,7 @@ bool WaitForGraph::Dfs(TransactionID start, TransactionID cur,
     auto it = g_.find(cur);
     if (it != g_.end()) {
         for (TransactionID nxt : it->second) {
-            if (Dfs(start, nxt, visited, stack)) return true;
+            if (Dfs(start, nxt, visited, stack, cycle_out)) return true;
         }
     }
 
@@ -47,17 +52,19 @@ bool WaitForGraph::Dfs(TransactionID start, TransactionID cur,
 }
 
 bool WaitForGraph::DetectCycle(TransactionID* victim) const {
-    // 若检测到环，选择涉及到的最大 txn_id 作为牺牲者
+    // 若检测到环，从环上的节点中选择 txn_id 最大者作为牺牲者
+    // （不能从整个图中选，否则可能误伤环外的无辜事务）
     std::unordered_set<TransactionID> nodes;
     for (const auto& kv : g_) {
         nodes.insert(kv.first);
         for (auto h : kv.second) nodes.insert(h);
     }
+    std::unordered_set<TransactionID> cycle_nodes;
     for (auto t : nodes) {
         std::unordered_set<TransactionID> visited, st;
-        if (Dfs(t, t, visited, st)) {
+        if (Dfs(t, t, visited, st, &cycle_nodes)) {
             TransactionID mx = 0;
-            for (auto n : nodes) mx = std::max(mx, n);
+            for (auto n : cycle_nodes) mx = std::max(mx, n);
             if (victim) *victim = mx;
             return true;
         }
@@ -66,10 +73,10 @@ bool WaitForGraph::DetectCycle(TransactionID* victim) const {
 }
 
 static bool IsX(LockType t) { return t == LockType::kExclusiveLock; }
-static bool IsS(LockType t) { return t == LockType::kSharedLock; }
 
 bool LockManager::Compatible(LockType held, LockType requested) {
-    if (IsX(held) || IsX(requested)) return held == requested && held == LockType::kExclusiveLock ? true : false;
+    // X 与任何锁（包括另一个 X）都不兼容；同事务的重入在 CanGrant 中跳过自身处理
+    if (IsX(held) || IsX(requested)) return false;
     return true; // S 与 S 兼容
 }
 
@@ -124,7 +131,7 @@ Status LockManager::Acquire(const std::string& key, TransactionID txn_id, LockTy
     }
 
     // 加入等待队列
-    entry->waiters.push({txn_id, type});
+    entry->waiters.push_back({txn_id, type});
 
     // 更新等待图
     {
@@ -135,31 +142,35 @@ Status LockManager::Acquire(const std::string& key, TransactionID txn_id, LockTy
         // 死锁预检：若本次等待会成环，直接返回 Aborted
         for (const auto& h : entry->holders) {
             if (graph_.WouldCreateCycle(txn_id, h.txn_id)) {
-                // 移除排队
-                // 在锁内清理队首
-                if (!entry->waiters.empty() && entry->waiters.front().txn_id == txn_id) {
-                    entry->waiters.pop();
-                }
+                // 无论是否在队首，都要把本事务移出等待队列，避免残留"幽灵等待者"
+                RemoveWaiter(entry.get(), txn_id);
+                graph_.RemoveEdgesFor(txn_id);
                 return Status::Aborted("Deadlock detected");
             }
         }
     }
 
-    // 等待
-    bool ok = entry->cv.wait_for(lk, timeout, [&](){ return CanGrant(*entry, txn_id, type); });
+    // 等待（被标记为死锁牺牲者时立即唤醒并以 Aborted 返回）
+    bool ok = entry->cv.wait_for(lk, timeout, [&](){
+        return IsAborted(txn_id) || CanGrant(*entry, txn_id, type);
+    });
+    if (IsAborted(txn_id)) {
+        RemoveWaiter(entry.get(), txn_id);
+        std::lock_guard<std::mutex> gl(graph_mu_);
+        graph_.RemoveEdgesFor(txn_id);
+        return Status::Aborted("Deadlock victim");
+    }
     if (!ok) {
         // 超时，移除队列与等待图边
-        if (!entry->waiters.empty() && entry->waiters.front().txn_id == txn_id) {
-            entry->waiters.pop();
-        }
+        RemoveWaiter(entry.get(), txn_id);
         std::lock_guard<std::mutex> gl(graph_mu_);
         graph_.RemoveEdgesFor(txn_id);
         return Status::TimedOut("Lock wait timeout");
     }
 
-    // 授予
+    // 授予（能被授予的一定是队首）
     if (!entry->waiters.empty() && entry->waiters.front().txn_id == txn_id) {
-        entry->waiters.pop();
+        entry->waiters.pop_front();
     }
     entry->holders.push_back({txn_id, type});
     std::lock_guard<std::mutex> gl(graph_mu_);
@@ -167,9 +178,28 @@ Status LockManager::Acquire(const std::string& key, TransactionID txn_id, LockTy
     return Status::OK();
 }
 
+void LockManager::RemoveWaiter(LockEntry* entry, TransactionID txn_id) {
+    for (auto it = entry->waiters.begin(); it != entry->waiters.end(); ++it) {
+        if (it->txn_id == txn_id) {
+            entry->waiters.erase(it);
+            return;
+        }
+    }
+}
+
+bool LockManager::IsAborted(TransactionID txn_id) const {
+    std::lock_guard<std::mutex> gl(graph_mu_);
+    return aborted_.count(txn_id) > 0;
+}
+
 Status LockManager::TryAcquire(const std::string& key, TransactionID txn_id, LockType type) {
     auto entry = GetOrCreate(key);
     std::unique_lock<std::mutex> lk(entry->mu);
+    if (IsAborted(txn_id)) {
+        std::lock_guard<std::mutex> gl(graph_mu_);
+        aborted_.erase(txn_id);
+        return Status::Aborted("Deadlock victim");
+    }
     if (RangeConflicts(key, type, txn_id)) {
         return Status::TimedOut("Range lock busy");
     }
@@ -270,11 +300,26 @@ void LockManager::DetectAndResolveDeadlocks() {
             aborted_.insert(victim);
         }
     }
-    if (has_cycle) {
-        // 广播唤醒等待者，让被标记事务快速失败
+    if (has_cycle && victim) {
+        // 释放牺牲者已持有的锁，并把牺牲者从所有等待队列中移除，
+        // 让环上其他事务能继续推进；牺牲者自身的等待会因 aborted_ 标记醒来并失败
+        ReleaseAll(victim);
         std::shared_lock<std::shared_mutex> rlock(table_mu_);
         for (const auto& kv : table_) {
-            kv.second->cv.notify_all();
+            bool removed = false;
+            {
+                std::unique_lock<std::mutex> lk(kv.second->mu);
+                size_t before = kv.second->waiters.size();
+                for (auto it = kv.second->waiters.begin(); it != kv.second->waiters.end();) {
+                    if (it->txn_id == victim) {
+                        it = kv.second->waiters.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                removed = kv.second->waiters.size() != before;
+            }
+            if (removed) kv.second->cv.notify_all();
         }
         std::lock_guard<std::mutex> rl(range_mu_);
         range_cv_.notify_all();

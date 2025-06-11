@@ -78,6 +78,9 @@ public:
         return std::unique_ptr<Snapshot>(new DefaultSnapshot(snap_gen_.Current()));
     }
 
+    // 当前快照序列号（RC 事务读 LSM 时取读时刻的最新序列）
+    SnapshotSequence CurrentSnapshotSequence() const { return snap_gen_.Current(); }
+
 private:
     // 构建 ReadView
     ReadView BuildReadView(TransactionID my_txn, const TxnOptions& opts);

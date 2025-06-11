@@ -71,15 +71,17 @@ public:
     bool GetLatestActiveForTxn(const std::string& key, TransactionID txn_id,
                                VersionRecord* rec_out) const;
 
-    // 选择需要刷回的“最新已提交且未刷盘”版本（每个key最多一条）
+    // 选择需要刷回的“所有已提交且未刷盘”版本（每个 key 的多条历史版本都要落盘，
+    // 否则长读事务/快照读依赖的老版本一旦被 GC 清理就无副本可读）
     std::vector<std::pair<std::string, VersionRecord>> PickCommittedNotFlushed(size_t max_items) const;
 
     // 标记指定键（到指定 commit_snapshot）的已提交版本为已刷盘
     void MarkFlushed(const std::vector<std::pair<std::string, SnapshotSequence>>& keys);
 
-    // 垃圾回收：清理对所有活跃读视图不可见的老版本与 Aborted 版本
-    void GarbageCollect(const std::vector<TransactionID>& active_txn_ids,
-                        TransactionID up_limit_txn_id);
+    // 垃圾回收：清理 Aborted 版本与“已落盘且非最新”的提交版本。
+    // 保留规则：全部 Active；最新一条 Committed；所有未落盘(flushed=false)的 Committed。
+    // 老版本清理后，长读事务/快照读可通过 LSM 回退读取（刷回任务保证所有提交版本最终落盘）。
+    void GarbageCollect();
 
 private:
     // 获取或创建某 key 的版本链（新版本追加在链表尾端即可，读取按逆序扫描）

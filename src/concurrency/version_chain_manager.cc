@@ -80,9 +80,10 @@ Status VersionChainManager::GetVisible(const std::string& key,
         }
 
         if (rec.is_delete) {
-            // 可见的删除标记 => 不存在
+            // 可见的删除标记：用 Deleted 状态区分"已删除"与"无版本"，
+            // 调用方据此阻断回退到 LSM 的旧值
             *found = false;
-            return Status::OK();
+            return Status::Deleted("Key deleted at visible version");
         }
 
         *value = rec.value;
@@ -139,12 +140,12 @@ std::vector<std::pair<std::string, VersionRecord>> VersionChainManager::PickComm
         const std::string& key = kv.first;
         const auto& chain = kv.second;
 
-        // 找到该 key 最新的已提交且未刷盘版本
+        // 收集该 key 所有“已提交且未刷盘”的版本（不只最新一条）：
+        // 老版本同样可能被长读事务/快照读依赖，必须先落盘才能被 GC 清理
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
             const VersionRecord& rec = *it;
             if (rec.state == VersionState::kCommitted && !rec.flushed) {
                 out.emplace_back(key, rec);
-                break;
             }
         }
 
@@ -168,17 +169,8 @@ void VersionChainManager::MarkFlushed(const std::vector<std::pair<std::string, S
     }
 }
 
-void VersionChainManager::GarbageCollect(const std::vector<TransactionID>& active_txn_ids,
-                                         TransactionID up_limit_txn_id) {
+void VersionChainManager::GarbageCollect() {
     std::unique_lock<std::shared_mutex> lk(mu_);
-
-    std::vector<TransactionID> active = active_txn_ids;
-    std::sort(active.begin(), active.end());
-    active.erase(std::unique(active.begin(), active.end()), active.end());
-
-    auto is_active = [&](TransactionID id) {
-        return std::binary_search(active.begin(), active.end(), id);
-    };
 
     for (auto& kv : chains_) {
         auto& chain = kv.second;
@@ -188,30 +180,22 @@ void VersionChainManager::GarbageCollect(const std::vector<TransactionID>& activ
             return r.state == VersionState::kAborted;
         }), chain.end());
 
-        // 保留最新的一个对任何可能读视图可见的提交版本，其余更老的提交版本若对所有未来读视图都不可见则清理。
-        // 简化策略：保留最新的提交版本 + 所有 Active。
-        bool found_latest_committed = false;
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            if (it->state == VersionState::kCommitted) { found_latest_committed = true; break; }
-        }
-        if (!found_latest_committed) continue;
-
-        bool kept_latest = false;
+        // 从尾向头保留：全部 Active、最新一条 Committed、所有未落盘的 Committed。
+        // 已落盘的老提交版本可安全清理：长读事务/快照读会回退到 LSM 读取对应序号的数据
+        //（刷回任务保证所有提交版本最终都会落盘，见 PickCommittedNotFlushed）。
+        bool kept_latest_committed = false;
         std::vector<VersionRecord> kept;
         kept.reserve(chain.size());
         for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
             const VersionRecord& r = *it;
             if (r.state == VersionState::kActive) {
                 kept.push_back(r);
-                continue;
-            }
-            if (r.state == VersionState::kCommitted) {
-                if (!kept_latest) {
-                    kept.push_back(r); // 保留最新提交
-                    kept_latest = true;
-                } else {
-                    // 老的提交版本：若其创建者在 up_limit 前且不会再次被任何 RR 视图可见（保守略过复杂判断，直接清理）
+            } else if (r.state == VersionState::kCommitted) {
+                if (!kept_latest_committed || !r.flushed) {
+                    kept.push_back(r);
+                    kept_latest_committed = true;
                 }
+                // 其余（已落盘的老提交版本）丢弃
             }
         }
         std::reverse(kept.begin(), kept.end());

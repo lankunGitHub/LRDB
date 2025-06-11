@@ -110,6 +110,13 @@ private:
         std::string value; // 仅在 found=true 时有效
     };
     std::unordered_map<std::string, ReadEntry> read_set_;
+
+    // 是否已通过 Commit/Rollback 正常结束（析构时未结束的视为中止）
+    bool finished_{false};
+    // 读 LSM 时使用的快照序列号：RC 取读时刻的最新序列，RR/只读事务取 Begin 时的冻结序列
+    SnapshotSequence LsmReadSeq() const;
+    // Commit 中途失败时的回滚路径（标记中止、移出活跃集、释放锁）
+    void Abort();
 };
 
 } // namespace lrdb

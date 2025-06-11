@@ -1,8 +1,8 @@
 #pragma once
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
-#include <queue>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -22,7 +22,7 @@ struct LockRequest {
 struct LockEntry {
     std::string key;
     std::vector<LockRequest> holders;
-    std::queue<LockRequest> waiters;
+    std::deque<LockRequest> waiters; // deque：允许移除非队首的等待者（超时/死锁中止时清理）
     std::condition_variable cv;
     std::mutex mu;
 
@@ -44,7 +44,8 @@ public:
 private:
     bool Dfs(TransactionID start, TransactionID cur,
              std::unordered_set<TransactionID>& visited,
-             std::unordered_set<TransactionID>& stack) const;
+             std::unordered_set<TransactionID>& stack,
+             std::unordered_set<TransactionID>* cycle_out) const;
 
 private:
     // 邻接表：waiter -> {holders}
@@ -87,6 +88,11 @@ private:
     static bool CanGrant(const LockEntry& entry, TransactionID requester, LockType req);
 
     std::shared_ptr<LockEntry> GetOrCreate(const std::string& key);
+
+    // 从等待队列中移除指定事务（无论其是否在队首）
+    static void RemoveWaiter(LockEntry* entry, TransactionID txn_id);
+    // 查询事务是否被标记为死锁牺牲者
+    bool IsAborted(TransactionID txn_id) const;
 
     struct RangeLock { TransactionID txn_id; std::string start; std::string end; bool exclusive; };
     static bool Overlap(const std::string& a_start, const std::string& a_end,
