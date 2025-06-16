@@ -287,6 +287,12 @@ public:
   std::vector<std::string> ListColumnFamilies() const override;
   ColumnFamily *DefaultColumnFamily() const override;
 
+  // 按名称查找列族句柄（内部使用：Open 带描述符重开时复用已存在的列族）
+  ColumnFamily *GetColumnFamilyByName(const std::string &name) const;
+
+  // 标记只读模式（OpenForReadOnly 内部使用）
+  void SetReadOnly(bool read_only) { read_only_ = read_only; }
+
   // 数据库管理操作
   Status Flush(const FlushOptions &options) override;
   Status Flush(const FlushOptions &options,
@@ -339,6 +345,9 @@ private:
   std::atomic<bool> opened_;
   std::atomic<bool> closed_;
   std::atomic<bool> background_work_paused_;
+
+  // 只读打开（OpenForReadOnly）：拒绝一切写操作
+  bool read_only_{false};
 
   // 后台任务管理
   mutable std::mutex background_tasks_mutex_;

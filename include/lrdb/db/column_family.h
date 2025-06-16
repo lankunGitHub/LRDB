@@ -26,6 +26,7 @@ class WALManager;
 class SequenceGenerator;
 class Transaction;
 class ManifestManager;
+class BackgroundTaskManager;
 struct ColumnFamilyDescriptor;
 
 class DB;
@@ -97,7 +98,8 @@ class DefaultColumnFamily : public ColumnFamily {
 public:
   DefaultColumnFamily(uint32_t id, const std::string &name,
                       const ColumnFamilyOptions &options,
-                      const std::string& db_path);
+                      const std::string& db_path,
+                      BackgroundTaskManager* bg_manager = nullptr);
   ~DefaultColumnFamily() override;
 
   // 基本属性
@@ -179,7 +181,8 @@ private:
 // 列族管理器
 class ColumnFamilyManager {
 public:
-  ColumnFamilyManager(const std::string &db_path, const DBOptions &db_options);
+  ColumnFamilyManager(const std::string &db_path, const DBOptions &db_options,
+                      BackgroundTaskManager *bg_manager = nullptr);
   ~ColumnFamilyManager();
 
   // 初始化和关闭
@@ -191,6 +194,8 @@ public:
                             const std::string &name, ColumnFamily **handle);
   Status DropColumnFamily(ColumnFamily *column_family);
   Status DropColumnFamily(const std::string &name);
+  // 真正销毁已 Drop 的列族句柄（Drop 之后句柄仍可用，Destroy 后才失效）
+  Status DestroyColumnFamilyHandle(ColumnFamily *column_family);
 
   // 列族查询
   ColumnFamily *GetColumnFamily(uint32_t id) const;
@@ -237,12 +242,17 @@ public:
 private:
   std::string db_path_;
   DBOptions db_options_;
+  BackgroundTaskManager *bg_manager_; // 传给各列族的 LSMTree，注册刷盘/压缩任务
 
   std::atomic<uint32_t> next_column_family_id_;
   ColumnFamily *default_column_family_; // 改为原始指针，避免循环引用
   std::unordered_map<uint32_t, std::unique_ptr<ColumnFamily>>
       column_families_by_id_;
   std::unordered_map<std::string, ColumnFamily *> column_families_by_name_;
+
+  // 已逻辑删除、等待 DestroyColumnFamilyHandle 真正析构的列族。
+  // Drop 只从这里摘除索引并停用，句柄保持有效直到 Destroy
+  std::vector<std::unique_ptr<ColumnFamily>> dropped_families_;
   
   // 加载的列族描述符（用于恢复）
   std::vector<ColumnFamilyDescriptor> loaded_column_families_;

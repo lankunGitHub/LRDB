@@ -432,14 +432,33 @@ void TwoLevelIterator::SetDataIterator(Iterator* data_iter) {
 }
 
 void TwoLevelIterator::SkipEmptyDataBlocksForward() {
-    while (Valid() && !data_iter_->Valid()) {
-        Next();
+    // Valid() 定义为 data_iter_->Valid()，旧条件 "Valid() && !data_iter_->Valid()"
+    // 恒为假，跨块推进从未执行（若真满足又会自递归栈溢出）。
+    // 正确语义：当前数据块耗尽时前进索引并打开下一块
+    while (data_iter_ == nullptr || !data_iter_->Valid()) {
+        if (!index_iter_->Valid()) {
+            SetDataIterator(nullptr);
+            return;
+        }
+        index_iter_->Next();
+        InitDataBlock();
+        if (data_iter_ != nullptr) {
+            data_iter_->SeekToFirst();
+        }
     }
 }
 
 void TwoLevelIterator::SkipEmptyDataBlocksBackward() {
-    while (Valid() && !data_iter_->Valid()) {
-        Prev();
+    while (data_iter_ == nullptr || !data_iter_->Valid()) {
+        if (!index_iter_->Valid()) {
+            SetDataIterator(nullptr);
+            return;
+        }
+        index_iter_->Prev();
+        InitDataBlock();
+        if (data_iter_ != nullptr) {
+            data_iter_->SeekToLast();
+        }
     }
 }
 

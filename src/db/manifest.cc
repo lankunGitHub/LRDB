@@ -9,6 +9,8 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace lrdb {
 
@@ -278,16 +280,28 @@ Status ManifestWriter::Sync() {
     if (!is_open_.load()) {
         return Status::InvalidArgument("Manifest file not open");
     }
-    
+
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     if (file_) {
         file_->flush();
         if (file_->fail()) {
-            return Status::IOError("Failed to sync manifest file");
+            return Status::IOError("Failed to flush manifest file");
         }
     }
-    
+
+    // flush 只刷 C++ 流缓冲；列族元数据必须真正落盘，
+    // 否则掉电后 MANIFEST 与已落盘的 SST 不一致
+    int fd = ::open(filename_.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return Status::IOError("Failed to open manifest file for fsync");
+    }
+    int ret = ::fsync(fd);
+    ::close(fd);
+    if (ret != 0) {
+        return Status::IOError("Failed to fsync manifest file");
+    }
+
     return Status::OK();
 }
 
@@ -762,15 +776,30 @@ Status ManifestManager::RecoverFromManifestFile(const std::string& filename,
     
     ManifestRecord record;
     uint64_t local_max_sequence = 0;
-    
+
     while (!reader.IsEOF()) {
         s = reader.ReadNextRecord(&record);
         if (s.IsIncomplete()) {
             break; // 正常结束
         } else if (!s.ok()) {
-            return s; // 读取错误
+            // 记录损坏：逐字节重同步，跳过坏记录继续恢复其后的记录。
+            // 旧实现直接放弃整个文件：中段一条坏记录会让其后的所有
+            // 列族描述符丢失（列族"消失"，数据成为孤儿）
+            uint64_t resync_pos = 0;
+            if (!TryResyncManifestFile(filename, reader.GetReadPosition(),
+                                       &resync_pos)) {
+                LOG_WARN << "Manifest file " << filename
+                         << ": cannot resync after corruption, skipping rest";
+                return Status::Corruption(
+                    "Manifest resync failed (rest of file skipped)");
+            }
+            s = reader.Seek(resync_pos);
+            if (!s.ok()) {
+                return s;
+            }
+            continue;
         }
-        
+
         local_max_sequence = std::max(local_max_sequence, record.sequence_number);
         
         // 处理不同类型的记录
@@ -816,15 +845,35 @@ Status ManifestManager::RecoverFromManifestFile(const std::string& filename,
             case ManifestRecordType::kCheckpoint:
                 // 这些记录的主要目的是记录序列号
                 break;
-                
+
             default:
                 // 忽略未知记录类型
                 break;
         }
     }
-    
+
     *max_sequence = local_max_sequence;
     return Status::OK();
+}
+
+bool ManifestManager::TryResyncManifestFile(const std::string& filename,
+                                            uint64_t start_pos,
+                                            uint64_t* resync_pos) {
+    constexpr uint64_t kMaxResyncBytes = 64 * 1024;
+    ManifestRecord probe_record;
+    for (uint64_t offset = 1; offset <= kMaxResyncBytes; ++offset) {
+        ManifestReader probe(filename);
+        Status s = probe.Open();
+        if (!s.ok()) return false;
+        s = probe.Seek(start_pos + offset);
+        if (!s.ok()) return false;
+        s = probe.ReadNextRecord(&probe_record);
+        if (s.ok()) {
+            *resync_pos = start_pos + offset;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ============================================================================

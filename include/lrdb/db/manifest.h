@@ -194,15 +194,9 @@ public:
     Status Sync();
     
     // 恢复列族信息
-    Status RecoverColumnFamilies(std::vector<ColumnFamilyDescriptor>* cf_descriptors, 
+    Status RecoverColumnFamilies(std::vector<ColumnFamilyDescriptor>* cf_descriptors,
                                 uint64_t* last_sequence);
-    
-    // 切换到新的MANIFEST文件
-    Status SwitchToNewManifest();
-    
-    // 清理旧的MANIFEST文件
-    Status CleanupOldManifests(int keep_count = 3);
-    
+
     // 获取当前MANIFEST文件大小
     uint64_t GetCurrentManifestSize() const;
 
@@ -225,6 +219,11 @@ private:
     Status RecoverFromManifestFile(const std::string& filename,
                                   std::unordered_map<uint32_t, ColumnFamilyDescriptor>* cf_map,
                                   uint64_t* max_sequence);
+    // 损坏记录后的重同步：从 start_pos 起逐字节扫描，找到下一条
+    // 长度前缀+CRC 都合法的记录位置
+    static bool TryResyncManifestFile(const std::string& filename,
+                                      uint64_t start_pos,
+                                      uint64_t* resync_pos);
     
     // 禁止拷贝
     ManifestManager(const ManifestManager&) = delete;
