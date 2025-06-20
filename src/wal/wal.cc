@@ -54,25 +54,32 @@ Status WALRecord::Decode(const Slice& data) {
     transaction_id = coding::DecodeFixed64(p); p += 8;
     uint32_t key_len = coding::DecodeFixed32(p); p += 4;
     uint32_t value_len = coding::DecodeFixed32(p); p += 4;
-    
-    // 检查剩余数据长度
-    size_t remaining = data.size() - (p - data.data());
-    if (remaining < key_len + value_len + 4) {
+
+    // 检查剩余数据长度。
+    // 必须用 size_t 计算：uint32 的 key_len + value_len + 4 会回绕，
+    // 损坏记录可借此绕过长度校验造成越界读
+    const size_t header_len = 1 + 8 + 4 + 8 + 4 + 4;
+    if (data.size() != header_len + static_cast<size_t>(key_len) +
+                             static_cast<size_t>(value_len) + 4) {
+        return Status::Corruption("WAL record length mismatch");
+    }
+    if (static_cast<size_t>(key_len) > data.size() ||
+        static_cast<size_t>(value_len) > data.size() - key_len) {
         return Status::Corruption("WAL record data truncated");
     }
-    
+
     // 解析键值
     key = std::string(p, key_len); p += key_len;
     value = std::string(p, value_len); p += value_len;
-    
+
     // 解析CRC
     crc = coding::DecodeFixed32(p);
-    
+
     // 验证CRC
     if (!ValidateCRC()) {
         return Status::Corruption("WAL record CRC mismatch");
     }
-    
+
     return Status::OK();
 }
 
@@ -227,7 +234,8 @@ Status WALWriter::WriteRecords(const std::vector<WALRecord>& records) {
         
         file_size_.fetch_add(total_size);
         write_position_.fetch_add(total_size);
-        
+        unsynced_bytes_.fetch_add(total_size);
+
         return Status::OK();
         
     } catch (const std::exception& e) {
@@ -239,16 +247,34 @@ Status WALWriter::Sync() {
     if (!is_open_.load()) {
         return Status::InvalidArgument("WAL file not open");
     }
-    
+
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     if (file_) {
         file_->flush();
         if (file_->fail()) {
-            return Status::IOError("Failed to sync WAL file");
+            return Status::IOError("Failed to flush WAL file");
         }
     }
-    
+
+    // flush 只刷了 C++ 流缓冲；事务提交以 Sync 成功为持久化承诺，
+    // 必须真正 fsync 到磁盘，否则掉电会丢失"已提交"的记录
+    int fd = ::open(filename_.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return Status::IOError("Failed to open WAL file for fsync: " +
+                               std::string(strerror(errno)));
+    }
+    int ret = ::fsync(fd);
+    int close_ret = ::close(fd);
+    if (ret != 0) {
+        return Status::IOError("Failed to fsync WAL file: " +
+                               std::string(strerror(errno)));
+    }
+    if (close_ret != 0) {
+        return Status::IOError("Failed to close WAL file after fsync");
+    }
+
+    unsynced_bytes_.store(0);
     return Status::OK();
 }
 
@@ -258,6 +284,10 @@ uint64_t WALWriter::GetFileSize() const {
 
 bool WALWriter::IsOpen() const {
     return is_open_.load();
+}
+
+bool WALWriter::HasUnsyncedData() const {
+    return unsynced_bytes_.load() > 0;
 }
 
 uint64_t WALWriter::GetWritePosition() const {
@@ -307,7 +337,8 @@ Status WALWriter::WriteRecordInternal(const WALRecord& record) {
         
         file_size_.fetch_add(bytes_to_write);
         write_position_.fetch_add(bytes_to_write);
-        
+        unsynced_bytes_.fetch_add(bytes_to_write);
+
         return Status::OK();
         
     } catch (const std::exception& e) {
@@ -476,10 +507,12 @@ WALManager::WALManager(const std::string& db_path)
       initialized_(false), shutdown_(false),
       total_records_(0), total_bytes_(0), last_sequence_(0), lsm_tree_(nullptr) {
       
-    // 注册error_handler回调
+    // 注册error_handler回调。
+    // 不捕获 this：多个 WALManager（每列族一个）共用 "WAL" 键会互相覆盖，
+    // 且析构后该单例仍持有带悬垂 this 的 lambda
     ErrorRecoveryManager::Instance().RegisterCleanupCallback(
-        "WAL", 
-        [this](const std::string& component, const std::string& operation) -> Status {
+        "WAL",
+        [](const std::string& /*component*/, const std::string& /*operation*/) -> Status {
             return Status::OK(); // WAL清理逻辑
         }
     );
@@ -504,17 +537,15 @@ Status WALManager::Initialize() {
     
     while (std::chrono::steady_clock::now() - start < timeout) {
         try {
-            // 创建WAL目录
+            // 创建WAL目录（失败直接报错，不能静默降级到 /tmp：
+            // 恢复路径扫不到 /tmp，事务提交"成功"但数据不可恢复）
             std::string wal_dir = db_path_ + "/wal";
             if (!std::filesystem::exists(wal_dir)) {
-                try {
-                    std::filesystem::create_directories(wal_dir);
-                } catch (const std::exception& e) {
-                    // 如果目录创建失败，尝试使用临时目录
-                    wal_dir = "/tmp/test_wal_" + std::to_string(getpid());
-                    if (!std::filesystem::exists(wal_dir)) {
-                        std::filesystem::create_directories(wal_dir);
-                    }
+                std::error_code dir_ec;
+                std::filesystem::create_directories(wal_dir, dir_ec);
+                if (dir_ec) {
+                    return Status::IOError("Failed to create WAL directory: " +
+                                           dir_ec.message());
                 }
             }
             
@@ -529,7 +560,6 @@ Status WALManager::Initialize() {
                             try {
                                 uint64_t file_number = std::stoull(filename.substr(0, filename.size() - 4));
                                 max_file_number = std::max(max_file_number, file_number);
-                                std::cout << "    Debug: 发现WAL文件: " << filename << " (编号: " << file_number << ")" << std::endl;
                             } catch (...) {
                                 // 忽略无效的文件名
                             }
@@ -540,28 +570,28 @@ Status WALManager::Initialize() {
                 // 如果目录扫描失败，使用默认值
                 max_file_number = 0;
             }
-            
-            std::cout << "    Debug: 扫描到的最大文件号: " << max_file_number << std::endl;
+
+            LOG_INFO << "WAL scan: max file number = " << max_file_number;
             next_file_number_.store(max_file_number + 1);
-            
+
             // 创建当前WAL文件
             Status s = CreateNewWALFile();
             if (s.ok()) {
                 // 如果有现有的WAL文件，尝试恢复
                 if (max_file_number > 0) {
-                    std::cout << "    Debug: 开始恢复WAL文件..." << std::endl;
                     SequenceNumber last_sequence = 0;
                     Status recovery_s = RecoverFromWAL(&last_sequence);
                     if (!recovery_s.ok()) {
-                        // 恢复失败，记录错误但继续初始化
-                        std::cout << "    Debug: WAL恢复失败: " << recovery_s.ToString() << std::endl;
-                    } else {
-                        std::cout << "    Debug: WAL恢复成功，最后序列号: " << last_sequence << std::endl;
+                        // 恢复失败必须让初始化失败：
+                        // 静默继续会让数据库带着不完整的数据对外服务
+                        LOG_ERROR << "WAL recovery failed: "
+                                  << recovery_s.ToString();
+                        return recovery_s;
                     }
-                } else {
-                    std::cout << "    Debug: 没有发现现有WAL文件，跳过恢复" << std::endl;
+                    LOG_INFO << "WAL recovery succeeded, last sequence: "
+                             << last_sequence;
                 }
-                
+
                 initialized_.store(true);
                 return Status::OK();
             }
@@ -783,28 +813,32 @@ Status WALManager::Sync() {
 
 Status WALManager::CreateNewWALFile() {
     std::lock_guard<std::mutex> lock(wal_mutex_);
-    
+    return CreateNewWALFileLocked();
+}
+
+Status WALManager::CreateNewWALFileLocked() {
     // 关闭当前文件
     if (current_writer_) {
         current_writer_->Sync();
         current_writer_->Close();
         current_writer_.reset();
     }
-    
+
     // 创建新文件
     uint64_t file_number = next_file_number_.fetch_add(1);
     current_wal_filename_ = GenerateWALFilename(file_number);
-    
+
     try {
         current_writer_ = std::make_unique<WALWriter>(current_wal_filename_);
         Status s = current_writer_->Open();
         if (!s.ok()) {
-            // 如果打开失败，尝试使用临时文件名
-            std::string temp_filename = "/tmp/test_wal_" + std::to_string(getpid()) + "_" + 
-                                      std::to_string(file_number) + ".wal";
-            current_wal_filename_ = temp_filename;
-            current_writer_ = std::make_unique<WALWriter>(temp_filename);
-            return current_writer_->Open();
+            // 打开失败必须报错，不能静默降级写到 /tmp：
+            // 恢复路径扫不到 /tmp 里的文件，事务提交"成功"但数据不可恢复
+            std::string failed_name = current_wal_filename_;
+            current_writer_.reset();
+            current_wal_filename_.clear();
+            return Status::IOError("Failed to open WAL file: " + failed_name +
+                                   ": " + s.ToString());
         }
         return s;
     } catch (const std::exception& e) {
@@ -814,39 +848,42 @@ Status WALManager::CreateNewWALFile() {
 
 Status WALManager::ArchiveCurrentWAL() {
     std::lock_guard<std::mutex> lock(wal_mutex_);
-    
+    return ArchiveCurrentWALLocked();
+}
+
+Status WALManager::ArchiveCurrentWALLocked() {
     if (!current_writer_) {
         return Status::InvalidArgument("No current WAL file");
     }
-    
+
     // 同步并关闭当前文件
     Status s = current_writer_->Sync();
     if (!s.ok()) {
         return s;
     }
-    
+
     s = current_writer_->Close();
     if (!s.ok()) {
         return s;
     }
-    
+
     // 移动到归档目录
     try {
         std::string archive_dir = db_path_ + "/wal/archive";
         if (!std::filesystem::exists(archive_dir)) {
             std::filesystem::create_directories(archive_dir);
         }
-        
-        std::string archive_filename = archive_dir + "/" + 
+
+        std::string archive_filename = archive_dir + "/" +
                                      std::filesystem::path(current_wal_filename_).filename().string();
         std::filesystem::rename(current_wal_filename_, archive_filename);
     } catch (const std::exception& e) {
         return Status::IOError("Failed to archive WAL file: " + std::string(e.what()));
     }
-    
+
     current_writer_.reset();
     current_wal_filename_.clear();
-    
+
     return Status::OK();
 }
 
@@ -902,14 +939,16 @@ std::vector<std::string> WALManager::GetWALFiles() const {
         // 记录错误但不阻塞
         // 返回已找到的文件
     }
-    
-    // 按文件号排序（限制排序时间）
-    if (wal_files.size() > 1000) { // 如果文件太多，只取前1000个
+
+    // 先排序再截断：恢复必须看到所有文件，截断只能在排序后按序进行，
+    // 否则可能丢掉最新文件而把未重放的数据当已重放删除
+    std::sort(wal_files.begin(), wal_files.end());
+    if (wal_files.size() > 1000) {
+        LOG_WARN << "Too many WAL files (" << wal_files.size()
+                 << "), keeping the first 1000 by name";
         wal_files.resize(1000);
     }
-    
-    std::sort(wal_files.begin(), wal_files.end());
-    
+
     return wal_files;
 }
 
@@ -917,88 +956,70 @@ Status WALManager::RecoverFromWAL(SequenceNumber* last_sequence) {
     if (db_path_.empty()) {
         return Status::InvalidArgument("WALManager not properly configured");
     }
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
+
     auto wal_files = GetWALFiles();
     if (wal_files.empty()) {
         *last_sequence = 0;
         return Status::OK();
     }
-    
+
     // 按文件编号排序以确保恢复顺序
     std::sort(wal_files.begin(), wal_files.end());
-    
+
     SequenceNumber max_sequence = 0;
     uint64_t recovered_records = 0;
     uint64_t corrupted_records = 0;
-    std::vector<std::string> corrupted_files;
-    
-    // 恢复事务状态映射
+
+    // 事务状态与数据缓冲：跨文件保持，崩溃在半途的事务不会留下部分写入
     std::unordered_map<uint64_t, TransactionState> transaction_states;
-    
+    std::unordered_map<uint64_t, std::vector<WALRecord>> txn_buffers;
+
     for (const auto& filename : wal_files) {
         SequenceNumber file_last_sequence = 0;
         uint64_t file_records = 0;
         uint64_t file_corrupted = 0;
-        
-        Status s = RecoverFromWALFile(filename, &file_last_sequence, &file_records);
-        
-        if (s.ok()) {
-            max_sequence = std::max(max_sequence, file_last_sequence);
-            recovered_records += file_records;
-        } else if (s.IsCorruption()) {
-            corrupted_files.push_back(filename);
-            corrupted_records += file_corrupted;
-            
-            // 尝试恢复部分数据
-            Status partial_s = RecoverPartialWALFile(filename, &file_last_sequence, &file_records);
-            if (partial_s.ok()) {
-                max_sequence = std::max(max_sequence, file_last_sequence);
-                recovered_records += file_records;
-            }
-        } else {
-            // 严重错误，停止恢复
-            return Status::IOError("Fatal error during WAL recovery: " + s.ToString());
+
+        Status s = RecoverFromWALFile(filename, &file_last_sequence, &file_records,
+                                      &transaction_states, &txn_buffers,
+                                      &file_corrupted);
+        if (!s.ok()) {
+            // 严重错误，停止恢复并保留 WAL 文件供下次重试
+            *last_sequence = max_sequence;
+            return Status::IOError("Fatal error during WAL recovery: " +
+                                   s.ToString());
+        }
+        max_sequence = std::max(max_sequence, file_last_sequence);
+        recovered_records += file_records;
+        corrupted_records += file_corrupted;
+    }
+
+    // 文件结束后仍未提交的事务：丢弃缓冲（记录从未被应用，无需回滚 LSM）
+    txn_buffers.clear();
+
+    if (corrupted_records > 0) {
+        LOG_WARN << "WAL recovery skipped " << corrupted_records
+                 << " corrupted record(s) via resync";
+    }
+
+    // 重放完成：把恢复缓冲刷成 SST。只有刷盘成功才能删除 WAL 文件，
+    // 否则 WAL 是数据的唯一副本（之前无条件删除，刷盘失败即丢数据）
+    if (lsm_tree_) {
+        Status fs = lsm_tree_->FinishRecovery(max_sequence);
+        if (!fs.ok()) {
+            LOG_ERROR << "Failed to finish recovery, WAL files kept: "
+                      << fs.ToString();
+            *last_sequence = max_sequence;
+            return fs;
         }
     }
-    
-    // 验证事务一致性
-    Status consistency_status = ValidateTransactionConsistency(transaction_states);
-    if (!consistency_status.ok()) {
-        return Status::Corruption("Transaction consistency check failed: " + 
-                                 consistency_status.ToString());
-    }
-    
-    // 清理不完整的事务
-    for (const auto& [txn_id, state] : transaction_states) {
-        if (state != TransactionState::kCommitted) {
-            // 回滚未提交的事务
-            Status rollback_status = RollbackIncompleteTransaction(txn_id);
-            if (!rollback_status.ok()) {
-                // 记录警告但继续恢复
-            }
-        }
-    }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto recovery_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    
-    // 更新统计信息
-    total_records_.store(recovered_records);
-    
-    // 记录恢复结果
-    if (!corrupted_files.empty()) {
-        // 可以记录日志或返回警告状态
-    }
-    
+
     *last_sequence = max_sequence;
     if (max_sequence > 0) {
         last_sequence_.store(max_sequence);
     }
+    total_records_.store(recovered_records);
 
-    // 重放完成：删除已重放的WAL文件，避免下次打开时重复应用
-    // （当前写入器对应的新文件保留）
+    // 删除已重放的WAL文件（当前写入器对应的新文件保留）
     for (const auto &filename : wal_files) {
         if (filename == current_wal_filename_) {
             continue;
@@ -1033,8 +1054,8 @@ Status WALManager::TruncateLogs() {
         }
     }
 
-    // 归档目录一并清理
-    std::string archive_dir = db_path_ + "/archive";
+    // 归档目录一并清理（与 ArchiveCurrentWAL 的归档位置一致：wal/archive）
+    std::string archive_dir = db_path_ + "/wal/archive";
     if (std::filesystem::exists(archive_dir)) {
         for (const auto& entry : std::filesystem::directory_iterator(archive_dir, ec)) {
             if (ec) break;
@@ -1046,28 +1067,40 @@ Status WALManager::TruncateLogs() {
         }
     }
 
-    next_file_number_.store(1);
-    last_sequence_.store(0);
+    // 注意：这里绝不能重置 last_sequence_（也不能重置文件号）：
+    // 干净关闭后 SST 里仍保留着大序列号的数据，重开时调用方依赖
+    // GetLastSequence() 恢复快照序列号，清零会导致新会话序列号回退，
+    // 遮蔽已持久化的旧数据
 
-    LOG_INFO << "WAL files truncated, next file number reset to 1";
+    LOG_INFO << "WAL files truncated (last_sequence preserved: "
+             << last_sequence_.load() << ")";
     return Status::OK();
 }
 
 Status WALManager::CleanupOldWALFiles(SequenceNumber safe_sequence) {
-    auto wal_files = GetWALFiles();
-    
-    // 简化的清理策略：按排序后保留最新3个文件；若提供了 safe_sequence，则
-    // 可以进一步基于文件名中的序号阈值删除更老文件（这里假设文件名可解析序号）。
-    std::sort(wal_files.begin(), wal_files.end());
-    const size_t keep = 3;
-    if (wal_files.size() <= keep) return Status::OK();
-
-    for (size_t i = 0; i + keep < wal_files.size(); ++i) {
-        // 可选：基于 safe_sequence 做更严格判断（略）
-        std::error_code ec;
-        std::filesystem::remove(wal_files[i], ec);
+    // 保守策略：只有调用方给出安全序列号（该序列之前的数据已确认落盘）才删除。
+    // 旧实现按字典序"保留 3 个"，既与数据是否落盘无关（会删掉唯一数据副本），
+    // 又会因为归档路径的字典序把活动文件误删
+    if (safe_sequence == 0) {
+        return Status::OK(); // 没有安全点，绝不删除
     }
-    
+
+    std::lock_guard<std::mutex> lock(wal_mutex_);
+    auto wal_files = GetWALFiles();
+
+    for (const auto &filename : wal_files) {
+        // 当前写入文件绝不删除
+        if (filename == current_wal_filename_) {
+            continue;
+        }
+        // 只清理归档文件；活动目录中的文件可能仍被需要
+        if (filename.find("/archive/") == std::string::npos) {
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::remove(filename, ec);
+    }
+
     return Status::OK();
 }
 
@@ -1117,17 +1150,18 @@ Status WALManager::WriteRecordInternal(const WALRecord& record) {
     
     std::lock_guard<std::mutex> lock(wal_mutex_);
     
-    // 确保当前有可用的WAL文件
+    // 确保当前有可用的WAL文件（本函数已持 wal_mutex_，
+    // 必须用不加锁的内部版本，否则二次加锁自死锁）
     if (!current_writer_) {
-        Status s = CreateNewWALFile();
+        Status s = CreateNewWALFileLocked();
         if (!s.ok()) {
             return Status::IOError("Failed to create new WAL file: " + s.ToString());
         }
     }
-    
+
     // 检查是否需要切换WAL文件
     if (ShouldSwitchWAL()) {
-        Status s = SwitchToNewWAL();
+        Status s = SwitchToNewWALLocked();
         if (!s.ok()) {
             return Status::IOError("Failed to switch WAL file: " + s.ToString());
         }
@@ -1181,9 +1215,21 @@ std::string WALManager::GenerateWALFilename(uint64_t file_number) const {
 }
 
 Status WALManager::SwitchToNewWAL() {
-    // 归档当前WAL
+    std::lock_guard<std::mutex> lock(wal_mutex_);
+    return SwitchToNewWALLocked();
+}
+
+Status WALManager::SwitchToNewWALLocked() {
+    // 归档当前WAL（用不加锁版本，本函数已持 wal_mutex_）。
+    // 若配置了归档回调（回调可能再进入 WALManager），走回调路径
     if (archive_task_callback_) {
         archive_task_callback_();
+    } else {
+        Status archive_status = ArchiveCurrentWALLocked();
+        if (!archive_status.ok()) {
+            LOG_WARN << "Failed to archive WAL during switch: "
+                     << archive_status.ToString();
+        }
     }
 
     // 切换到新文件前，确保 wal 目录元数据持久化（提高崩溃安全）
@@ -1198,7 +1244,7 @@ Status WALManager::SwitchToNewWAL() {
         // 忽略目录 fsync 失败
     }
 
-    return CreateNewWALFile();
+    return CreateNewWALFileLocked();
 }
 
 bool WALManager::ShouldSwitchWAL() const {
@@ -1210,54 +1256,140 @@ bool WALManager::ShouldSwitchWAL() const {
 }
 
 // 从单个 WAL 文件恢复：顺序读取记录，应用到 LSM（恢复模式），返回该文件的最大序与记录数
-Status WALManager::RecoverFromWALFile(const std::string& filename, 
-                                     SequenceNumber* last_sequence,
-                                     uint64_t* record_count) {
+Status WALManager::RecoverFromWALFile(
+    const std::string& filename, SequenceNumber* last_sequence,
+    uint64_t* record_count,
+    std::unordered_map<uint64_t, TransactionState>* txn_states,
+    std::unordered_map<uint64_t, std::vector<WALRecord>>* txn_buffers,
+    uint64_t* corrupted_count) {
     WALReader reader(filename);
     Status s = reader.Open();
     if (!s.ok()) {
         return s;
     }
-    
+
     SequenceNumber max_sequence = 0;
     uint64_t count = 0;
-    WALRecord record;
-    
-    // 进入恢复模式以避免正常写路经副作用
-    if (lsm_tree_) lsm_tree_->SetRecoveryMode(true);
 
+    // 进入恢复模式以避免正常写路径副作用。
+    // 所有退出路径都必须复位，用 lambda 保证
+    if (lsm_tree_) lsm_tree_->SetRecoveryMode(true);
+    auto exit_recovery = [&]() {
+        if (lsm_tree_) lsm_tree_->SetRecoveryMode(false);
+    };
+
+    WALRecord record;
+    Status loop_status = Status::OK();
     while (!reader.IsEOF()) {
         s = reader.ReadNextRecord(&record);
         if (s.IsIncomplete()) {
-            break; // 正常结束
+            break; // 写入中断的尾部，正常结束
         } else if (!s.ok()) {
-            return s; // 读取错误
+            // 记录损坏（CRC/长度错误）：按长度前缀逐字节重同步，
+            // 跳过坏记录继续恢复其后的记录（旧的"部分恢复"实现会从头重放，
+            // 既重复应用又放弃损坏点之后的数据）
+            uint64_t resync_pos = 0;
+            if (!TryResyncWALFile(filename, reader.GetReadPosition(),
+                                  &resync_pos)) {
+                LOG_WARN << "WAL file " << filename
+                         << ": cannot resync after corruption, stopping";
+                loop_status = Status::Corruption(
+                    "WAL resync failed (file keeps remaining records)");
+                break;
+            }
+            if (corrupted_count) (*corrupted_count)++;
+            s = reader.Seek(resync_pos);
+            if (!s.ok()) {
+                loop_status = s;
+                break;
+            }
+            continue;
         }
-        
-        // 应用WAL记录
-        s = ApplyWALRecord(record);
+
+        // 应用记录（带事务缓冲）
+        SequenceNumber applied_seq = 0;
+        s = ApplyRecoveredRecord(record, txn_states, txn_buffers, &applied_seq);
         if (!s.ok()) {
-            if (lsm_tree_) lsm_tree_->SetRecoveryMode(false);
-            return s;
+            loop_status = s;
+            break;
         }
-        
+
         max_sequence = std::max(max_sequence, record.sequence_number);
+        max_sequence = std::max(max_sequence, applied_seq);
         count++;
     }
-    
-    // 退出恢复模式并完成收尾
-    if (lsm_tree_) {
-        Status fs = lsm_tree_->FinishRecovery(max_sequence);
-        if (!fs.ok()) {
-            lsm_tree_->SetRecoveryMode(false);
-            return fs;
-        }
-        lsm_tree_->SetRecoveryMode(false);
+
+    exit_recovery();
+    if (!loop_status.ok()) {
+        return loop_status;
     }
 
     *last_sequence = max_sequence;
     *record_count = count;
     return Status::OK();
+}
+
+bool WALManager::TryResyncWALFile(const std::string& filename,
+                                  uint64_t start_pos, uint64_t* resync_pos) {
+    constexpr uint64_t kMaxResyncBytes = 64 * 1024;
+    WALRecord probe_record;
+    for (uint64_t offset = 1; offset <= kMaxResyncBytes; ++offset) {
+        WALReader probe(filename);
+        Status s = probe.Open();
+        if (!s.ok()) return false;
+        s = probe.Seek(start_pos + offset);
+        if (!s.ok()) return false;
+        s = probe.ReadNextRecord(&probe_record);
+        if (s.ok()) {
+            // 找到一条长度前缀与 CRC 都合法的完整记录
+            *resync_pos = start_pos + offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+// 恢复路径的记录应用（带事务缓冲）
+Status WALManager::ApplyRecoveredRecord(
+    const WALRecord& record,
+    std::unordered_map<uint64_t, TransactionState>* txn_states,
+    std::unordered_map<uint64_t, std::vector<WALRecord>>* txn_buffers,
+    SequenceNumber* applied_max_sequence) {
+    *applied_max_sequence = 0;
+
+    // 非事务记录直接应用（主提交路径写的就是这类记录）
+    if (record.transaction_id == 0) {
+        return ApplyWALRecord(record);
+    }
+
+    switch (record.type) {
+    case WALRecordType::kBeginTransaction:
+        (*txn_states)[record.transaction_id] = TransactionState::kActive;
+        return Status::OK();
+    case WALRecordType::kCommitTransaction: {
+        // 事务提交：按序应用缓冲的数据记录
+        auto it = txn_buffers->find(record.transaction_id);
+        if (it != txn_buffers->end()) {
+            for (const auto &r : it->second) {
+                Status s = ApplyWALRecord(r);
+                if (!s.ok()) return s;
+                *applied_max_sequence =
+                    std::max(*applied_max_sequence, r.sequence_number);
+            }
+            txn_buffers->erase(it);
+        }
+        (*txn_states)[record.transaction_id] = TransactionState::kCommitted;
+        return Status::OK();
+    }
+    case WALRecordType::kAbortTransaction:
+        txn_buffers->erase(record.transaction_id);
+        (*txn_states)[record.transaction_id] = TransactionState::kAborted;
+        return Status::OK();
+    default:
+        // Put/Delete/Merge 等事务数据记录：先缓冲，确认提交后才应用
+        (*txn_buffers)[record.transaction_id].push_back(record);
+        return Status::OK();
+    }
 }
 
 // 将一条 WAL 记录应用到存储引擎（恢复路径）
@@ -1290,15 +1422,10 @@ Status WALManager::ApplyWALRecord(const WALRecord& record) {
             }
             
             case WALRecordType::kMerge: {
-                // 应用Merge操作到LSMTree（如果可用，暂时使用Put）
-                if (lsm_tree_) {
-                    Status s = lsm_tree_->RecoverFromWALRecord(record.key, record.value, 
-                                                              record.sequence_number, false);
-                    if (!s.ok()) {
-                        return Status::IOError("Failed to apply Merge operation during recovery: " + s.ToString());
-                    }
-                }
-                break;
+                // Merge 语义未实现：按 Put 重放会把合并语义静默变成覆盖，
+                // 宁可显式报错也不伪装成功
+                return Status::NotSupported(
+                    "WAL replay of kMerge records is not supported");
             }
             
             case WALRecordType::kBeginTransaction: {
@@ -1336,29 +1463,18 @@ Status WALManager::ApplyWALRecord(const WALRecord& record) {
             }
             
             case WALRecordType::kCheckpoint: {
-                // 处理检查点 - 在恢复过程中，检查点主要用于同步序列号
-                LOG_INFO << "Recovery: Checkpoint encountered at sequence " << record.sequence_number;
-                
-                if (lsm_tree_) {
-                    // 触发一次刷盘以确保数据持久化
-                    Status flush_status = lsm_tree_->TriggerFlush();
-                    if (!flush_status.ok()) {
-                        LOG_WARN << "Failed to trigger flush during checkpoint recovery: " << flush_status.ToString();
-                    }
-                }
+                // 检查点记录只用于同步序列号（在收尾时统一处理）。
+                // 恢复期间不能触发刷盘：会把恢复用的 memtable 标记为
+                // immutable，导致后续恢复写入失败
+                LOG_INFO << "Recovery: Checkpoint encountered at sequence "
+                         << record.sequence_number;
                 break;
             }
-            
+
             case WALRecordType::kFlushMemTable: {
-                // MemTable刷盘 - 在恢复过程中触发刷盘
-                LOG_INFO << "Recovery: MemTable flush marker at sequence " << record.sequence_number;
-                
-                if (lsm_tree_) {
-                    Status flush_status = lsm_tree_->TriggerFlush();
-                    if (!flush_status.ok()) {
-                        LOG_WARN << "Failed to apply MemTable flush during recovery: " << flush_status.ToString();
-                    }
-                }
+                // 刷盘标记在重放时无实际作用（数据统一在 FinishRecovery 落盘）
+                LOG_INFO << "Recovery: MemTable flush marker at sequence "
+                         << record.sequence_number;
                 break;
             }
             
@@ -1708,8 +1824,33 @@ Status RecoveryManager::CreateCheckpoint(SequenceNumber sequence) {
 }
 
 Status RecoveryManager::RestoreFromCheckpoint(SequenceNumber checkpoint_sequence) {
-    std::string checkpoint_file = db_path_ + "/checkpoint_" + std::to_string(checkpoint_sequence);
-    
+    // CreateCheckpoint 把文件写到 db_path_/checkpoints/checkpoint_<seq>_<ts>.meta，
+    // 这里必须去同一目录找（旧实现去 db_path_ 根目录找无后缀文件，永远找不到）
+    std::string checkpoint_dir = db_path_ + "/checkpoints";
+    std::string checkpoint_file;
+    std::error_code ec;
+    if (!std::filesystem::exists(checkpoint_dir, ec)) {
+        return Status::IOError("Checkpoint directory does not exist");
+    }
+    for (const auto &entry :
+         std::filesystem::directory_iterator(checkpoint_dir, ec)) {
+        if (ec) break;
+        std::string name = entry.path().filename().string();
+        // 匹配该序列号的检查点（时间戳部分任意，取最新即字典序最大）
+        std::string prefix =
+            "checkpoint_" + std::to_string(checkpoint_sequence) + "_";
+        if (name.rfind(prefix, 0) == 0) {
+            if (checkpoint_file.empty() || name > std::filesystem::path(checkpoint_file).filename().string()) {
+                checkpoint_file = entry.path().string();
+            }
+        }
+    }
+    if (checkpoint_file.empty()) {
+        return Status::NotFound("Checkpoint " +
+                                std::to_string(checkpoint_sequence) +
+                                " not found");
+    }
+
     SequenceNumber sequence;
     return LoadCheckpoint(checkpoint_file, &sequence);
 }
@@ -1767,17 +1908,19 @@ Status RecoveryManager::RecoverFromWALFiles(const std::vector<std::string>& wal_
                 recovery_stats_.corrupted_records++;
                 break; // 文件损坏
             }
-            
-            // 这里需要实际应用记录到存储引擎
-            // 简化实现，只记录统计信息
-            recovery_stats_.records_recovered++;
-            max_sequence = std::max(max_sequence, record.sequence_number);
+
+            // 独立 RecoveryManager 没有挂接存储引擎，无法应用记录。
+            // 与其"返回成功但什么都没做"（静默丢数据），不如显式报未实现，
+            // 让调用方改走 WALManager::RecoverFromWAL（列族初始化已使用该路径）
+            return Status::NotSupported(
+                "RecoveryManager is not wired to a storage engine; use "
+                "WALManager::RecoverFromWAL");
         }
     }
-    
+
     *last_sequence = max_sequence;
     recovery_stats_.recovered_sequence = max_sequence;
-    
+
     return Status::OK();
 }
 
@@ -1830,8 +1973,8 @@ Status RecoveryManager::LoadCheckpoint(const std::string& checkpoint_file,
     }
     
     *sequence = coding::DecodeFixed64(header);
-    uint64_t timestamp = coding::DecodeFixed64(header + 8);
-    
+    // uint64_t timestamp = coding::DecodeFixed64(header + 8);
+    (void)header; // 时间戳字段保留未用
     return Status::OK();
 }
 
@@ -2081,17 +2224,19 @@ LSMTree* WALManager::GetLSMTree() const {
 
 // 检查是否需要执行后台任务
 bool WALManager::NeedsSync() const {
+    // 加锁访问 current_writer_（Shutdown/Archive/Truncate 会在锁内 reset 它）
+    std::lock_guard<std::mutex> lock(wal_mutex_);
     if (!current_writer_ || !current_writer_->IsOpen()) {
         return false;
     }
-    
+
     // 如果启用了写入时同步，则不需要后台同步
     if (sync_on_write_.load()) {
         return false;
     }
-    
-    // 检查是否有未同步的数据
-    return current_writer_->GetFileSize() > 0;
+
+    // 有未 fsync 的数据才需要同步（同步成功后计数归零，任务不会空转）
+    return current_writer_->HasUnsyncedData();
 }
 
 bool WALManager::NeedsArchive() const {
@@ -2117,39 +2262,35 @@ Status WALManager::WriteBatch(uint32_t column_family_id, const std::vector<Versi
     if (entries.empty()) {
         return Status::OK();
     }
-    
+
     if (!initialized_.load()) {
         return Status::InvalidArgument("WAL manager not initialized");
     }
-    
-    std::lock_guard<std::mutex> lock(wal_mutex_);
-    
-    // 批量写入所有记录
+
+    // 不要在外部持 wal_mutex_：WriteRecordInternal 内部会加锁，
+    // 这里再持锁会自我死锁
     for (const auto& entry : entries) {
         WALRecord record;
-        record.sequence_number = 0; // 临时修复：设置为0
-        record.column_family_id = column_family_id;  // 列族标识
+        // 按条目自身的类型与序列号写入（之前的占位实现把 seq 置 0 且
+        // 一律当 Put 写，既写不进去也丢失语义）
+        record.type = entry.type;
+        record.sequence_number = entry.sequence_number;
+        record.column_family_id = column_family_id;
         record.key = entry.key;
         record.value = entry.value;
-        record.transaction_id = 0; // 批量操作通常是非事务的
-        
-        if (false) { // 临时修复：假设不是删除操作
-            record.type = WALRecordType::kDelete;
-        } else {
-            record.type = WALRecordType::kPut;
-        }
-        
+        record.transaction_id = entry.transaction_id;
+
         Status s = WriteRecordInternal(record);
         if (!s.ok()) {
             return s;
         }
     }
-    
+
     // 批量写入后立即同步（可选）
     if (sync_on_write_.load()) {
         return Sync();
     }
-    
+
     return Status::OK();
 }
 
@@ -2159,50 +2300,6 @@ Status WALManager::WriteBatch(uint32_t column_family_id, const std::vector<Versi
 
 // 部分WAL文件恢复（处理损坏的文件）
 // 尝试从损坏的 WAL 文件中恢复尽可能多的记录（容错）
-Status WALManager::RecoverPartialWALFile(const std::string& filename,
-                                        SequenceNumber* last_sequence,
-                                        uint64_t* record_count) {
-    WALReader reader(filename);
-    Status s = reader.Open();
-    if (!s.ok()) {
-        return s;
-    }
-    
-    SequenceNumber max_seq = 0;
-    uint64_t recovered = 0;
-    WALRecord record;
-    
-    if (lsm_tree_) lsm_tree_->SetRecoveryMode(true);
-
-    // 尝试恢复每条记录
-    while (true) {
-        Status read_status = reader.ReadNextRecord(&record);
-        if (!read_status.ok()) {
-            break;
-        }
-        
-        if (read_status.ok()) {
-            // 应用有效记录
-            Status apply_status = ApplyWALRecord(record);
-            if (apply_status.ok()) {
-                max_seq = std::max(max_seq, record.sequence_number);
-                recovered++;
-            }
-        }
-        // 忽略损坏的记录，继续尝试读取下一条
-    }
-    
-    if (lsm_tree_) {
-        Status fs = lsm_tree_->FinishRecovery(max_seq);
-        if (!fs.ok()) { lsm_tree_->SetRecoveryMode(false); return fs; }
-        lsm_tree_->SetRecoveryMode(false);
-    }
-
-    *last_sequence = max_seq;
-    *record_count = recovered;
-    return Status::OK();
-}
-
 // 事务一致性验证
 Status WALManager::ValidateTransactionConsistency(
     const std::unordered_map<uint64_t, TransactionState>& transaction_states) {

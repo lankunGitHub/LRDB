@@ -107,15 +107,19 @@ public:
     
     // 检查是否已打开
     bool IsOpen() const;
-    
+
     // 获取写入位置
     uint64_t GetWritePosition() const;
+
+    // 是否存在未 fsync 的数据（供后台同步任务判断）
+    bool HasUnsyncedData() const;
 
 private:
     std::string filename_;
     std::unique_ptr<std::ofstream> file_;
     std::atomic<uint64_t> file_size_;
     std::atomic<uint64_t> write_position_;
+    std::atomic<uint64_t> unsynced_bytes_;
     std::atomic<bool> is_open_;
     mutable std::mutex mutex_;
     
@@ -288,17 +292,37 @@ private:
     std::string GenerateWALFilename(uint64_t file_number) const;
     Status SwitchToNewWAL();
     bool ShouldSwitchWAL() const;
+
+    // 不加锁的内部实现（调用方必须已持有 wal_mutex_）：
+    // 公开的 CreateNewWALFile/SwitchToNewWAL 会加锁，若在持锁路径再调用会自死锁
+    Status CreateNewWALFileLocked();
+    Status SwitchToNewWALLocked();
+    Status ArchiveCurrentWALLocked();
     
 
     
     // 恢复辅助方法
-    Status RecoverFromWALFile(const std::string& filename, 
+    Status RecoverFromWALFile(const std::string& filename,
                               SequenceNumber* last_sequence,
-                              uint64_t* record_count);
-    Status RecoverPartialWALFile(const std::string& filename,
-                                SequenceNumber* last_sequence,
-                                uint64_t* record_count);
+                              uint64_t* record_count,
+                              std::unordered_map<uint64_t, TransactionState>* txn_states,
+                              std::unordered_map<uint64_t, std::vector<WALRecord>>* txn_buffers,
+                              uint64_t* corrupted_count);
     Status ApplyWALRecord(const WALRecord& record);
+
+    // 恢复路径的记录应用（带事务缓冲）：非事务记录直接应用；
+    // 事务数据记录先入缓冲，看到 Commit 才按序应用，Abort/文件结束则丢弃，
+    // 崩溃在半途的事务不会留下部分写入。返回本次应用的最大序列号
+    Status ApplyRecoveredRecord(
+        const WALRecord& record,
+        std::unordered_map<uint64_t, TransactionState>* txn_states,
+        std::unordered_map<uint64_t, std::vector<WALRecord>>* txn_buffers,
+        SequenceNumber* applied_max_sequence);
+
+    // 损坏记录后的重同步：从 start_pos 起逐字节扫描，找到下一个
+    // 长度前缀+CRC 都合法的记录位置（最多向后扫描 kMaxResyncBytes 字节）
+    bool TryResyncWALFile(const std::string& filename, uint64_t start_pos,
+                          uint64_t* resync_pos);
     
     // 事务一致性和恢复
     Status ValidateTransactionConsistency(const std::unordered_map<uint64_t, TransactionState>& transaction_states);
