@@ -4,8 +4,10 @@
 
 #include "lrdb/core/status.h"
 #include "lrdb/util/logging.h"
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -62,7 +64,9 @@ struct ErrorReport {
     uint64_t first_occurrence;
     uint64_t last_occurrence;
     
-    ErrorReport() = default;  // 默认构造函数
+    ErrorReport()
+        : type(ErrorType::MemoryError), severity(ErrorSeverity::Low),
+          occurrence_count(0), first_occurrence(), last_occurrence() {}
     
     ErrorReport(const Status& s, ErrorType t, ErrorSeverity sev, 
                const ErrorContext& ctx)
@@ -117,7 +121,7 @@ private:
     std::vector<ErrorReport> error_reports_;
     std::unordered_map<std::string, size_t> error_signature_map_;
     size_t max_reports_;
-    ErrorSeverity severity_threshold_;
+    std::atomic<ErrorSeverity> severity_threshold_;
     std::function<void(const ErrorReport&)> error_callback_;
     
     // 生成错误签名
@@ -220,9 +224,16 @@ public:
     
     // 注册组件清理回调（由各模块自己注册）
     void RegisterCleanupCallback(const std::string& component_name, ComponentCleanupCallback callback);
-    
+
+    // 注销组件清理回调（组件析构时必须调用，
+    // 否则注册表持有捕获 this 的 lambda 形成悬垂指针）
+    void UnregisterCleanupCallback(const std::string& component_name);
+
     // 注册错误类型恢复回调
     void RegisterRecoveryCallback(ErrorType error_type, ErrorRecoveryCallback callback);
+
+    // 注销错误类型恢复回调
+    void UnregisterRecoveryCallback(ErrorType error_type);
     
     // 注册通用恢复回调（处理所有错误）
     void RegisterGlobalRecoveryCallback(ErrorRecoveryCallback callback);

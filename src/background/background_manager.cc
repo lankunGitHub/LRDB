@@ -67,6 +67,18 @@ Status BackgroundTaskManager::Shutdown() {
     }
     worker_threads_.clear();
 
+    // 等待所有延迟重排线程退出（它们醒来后看到 shutdown_ 会直接结束）。
+    // 不 join 的话，这些线程可能在对象析构后才访问成员
+    {
+        std::lock_guard<std::mutex> lock(delay_threads_mu_);
+        for (auto& dt : delay_threads_) {
+            if (dt.thread.joinable()) {
+                dt.thread.join();
+            }
+        }
+        delay_threads_.clear();
+    }
+
     // 清理队列
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -355,9 +367,7 @@ std::vector<std::shared_ptr<BackgroundTask>> BackgroundTaskManager::GetTaskBatch
 
 Status BackgroundTaskManager::ExecuteTask(const std::shared_ptr<BackgroundTask>& task) {
     busy_thread_count_.fetch_add(1);
-    
-    auto start_time = std::chrono::steady_clock::now();
-    
+
     Status status;
     try {
         LOG_DEBUG << "Executing task: " << task->name << " (ID: " << task->task_id << ")";
@@ -410,30 +420,47 @@ double BackgroundTaskManager::GetAdaptiveDelayFactor() const {
 
 void BackgroundTaskManager::SchedulePeriodicTaskInternal(
     const std::shared_ptr<BackgroundTask>& task) {
-    
+
     // 计算下次执行时间，应用自适应延迟
     auto base_interval = task->interval;
     double delay_factor = GetAdaptiveDelayFactor();
     auto adjusted_interval = std::chrono::milliseconds(
         static_cast<int>(base_interval.count() * delay_factor));
-    
+
     // 创建新的任务实例用于下次执行
     auto next_task = std::make_shared<BackgroundTask>(*task);
     next_task->task_id = next_task_id_.fetch_add(1);
     next_task->schedule_time = std::chrono::steady_clock::now() + adjusted_interval;
     next_task->cancel_requested.store(false);
-    
-    // 延迟调度
-    std::thread([this, next_task, adjusted_interval]() {
+
+    // 延迟调度。线程必须登记并由 Shutdown join：
+    // detach 的线程可能在管理器析构后才醒来，写入已释放的队列（UAF）
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    std::thread t([this, next_task, adjusted_interval, done]() {
         std::this_thread::sleep_for(adjusted_interval);
-        
+
         if (!shutdown_.load() && !next_task->cancel_requested.load()) {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             task_queue_.push(next_task);
             active_tasks_[next_task->task_id] = next_task;
             task_cv_.notify_one();
         }
-    }).detach();
+        done->store(true);
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(delay_threads_mu_);
+        // 顺手回收已完成的延迟线程，避免长会话中线程对象无限堆积
+        for (auto it = delay_threads_.begin(); it != delay_threads_.end();) {
+            if (it->done->load()) {
+                if (it->thread.joinable()) it->thread.join();
+                it = delay_threads_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        delay_threads_.push_back(DelayThread{std::move(t), done});
+    }
 }
 
 uint64_t BackgroundTaskManager::GenerateTaskID() {

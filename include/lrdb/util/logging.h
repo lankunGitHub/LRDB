@@ -160,11 +160,11 @@ std::unique_ptr<Log> CreateMultiLog();
 #define LOG_ERROR lrdb::LogStream(lrdb::LogLevel::kError, __FILE__, __LINE__)
 #define LOG_FATAL lrdb::LogStream(lrdb::LogLevel::kFatal, __FILE__, __LINE__)
 
-// 条件日志 - 简化版本，让LogStream自己处理条件
-#define LOG_DEBUG_IF(condition) lrdb::LogStream(lrdb::LogLevel::kDebug, __FILE__, __LINE__)
-#define LOG_INFO_IF(condition) lrdb::LogStream(lrdb::LogLevel::kInfo, __FILE__, __LINE__)  
-#define LOG_WARN_IF(condition) lrdb::LogStream(lrdb::LogLevel::kWarn, __FILE__, __LINE__)
-#define LOG_ERROR_IF(condition) lrdb::LogStream(lrdb::LogLevel::kError, __FILE__, __LINE__)
+// 条件日志（condition 必须被真正求值；旧实现把条件直接丢掉，恒输出）
+#define LOG_DEBUG_IF(condition) if (condition) lrdb::LogStream(lrdb::LogLevel::kDebug, __FILE__, __LINE__)
+#define LOG_INFO_IF(condition) if (condition) lrdb::LogStream(lrdb::LogLevel::kInfo, __FILE__, __LINE__)
+#define LOG_WARN_IF(condition) if (condition) lrdb::LogStream(lrdb::LogLevel::kWarn, __FILE__, __LINE__)
+#define LOG_ERROR_IF(condition) if (condition) lrdb::LogStream(lrdb::LogLevel::kError, __FILE__, __LINE__)
 
 // 断言宏
 #define LRDB_ASSERT(condition) \

@@ -272,7 +272,13 @@ std::string GetTimestamp() {
         now.time_since_epoch()) % 1000;
     
     std::ostringstream oss;
-    oss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+    // localtime 不是线程安全的（返回进程级静态指针），改用 localtime_r
+    struct tm tm_buf;
+    if (localtime_r(&time_t, &tm_buf) != nullptr) {
+        oss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
+    } else {
+        oss << "unknown-time";
+    }
     oss << '.' << std::setfill('0') << std::setw(3) << ms.count();
     
     return oss.str();

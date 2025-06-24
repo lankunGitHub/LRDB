@@ -120,6 +120,10 @@ public:
       return std::string::npos;
     if (needle.size_ == 0)
       return start;
+    // needle 比剩余部分还长时 size_ - needle.size_ 会无符号下溢
+    // （回绕成极大值 → 循环恒真 → memcmp 越界读），必须提前返回
+    if (needle.size_ > size_ - start)
+      return std::string::npos;
 
     for (size_t i = start; i <= size_ - needle.size_; ++i) {
       if (memcmp(data_ + i, needle.data_, needle.size_) == 0) {

@@ -239,12 +239,15 @@ std::unique_ptr<Comparator> CreateCustomComparator(const std::string& name,
 // 前缀提取比较器
 class PrefixComparatorImpl : public Comparator {
 public:
-    explicit PrefixComparatorImpl(size_t prefix_len) : prefix_len_(prefix_len) {}
+    explicit PrefixComparatorImpl(size_t prefix_len)
+        : name_("lrdb.PrefixComparator." + std::to_string(prefix_len)),
+          prefix_len_(prefix_len) {}
     ~PrefixComparatorImpl() override = default;
-    
+
     const char* Name() const override {
-        static std::string name = "lrdb.PrefixComparator." + std::to_string(prefix_len_);
-        return name.c_str();
+        // 名字必须是实例成员：函数级 static 会被所有实例共享，
+        // prefix_len 不同的比较器返回同一个名字，按名比较时被误判为相同
+        return name_.c_str();
     }
     
     int Compare(const Slice& a, const Slice& b) const override {
@@ -252,6 +255,9 @@ public:
         Slice prefix_b = Slice(b.data(), std::min(b.size(), prefix_len_));
         return BytewiseComparator()->Compare(prefix_a, prefix_b);
     }
+
+private:
+    std::string name_;
     
     void FindShortestSeparator(std::string* start, const Slice& limit) const override {
         if (start->size() > prefix_len_) {

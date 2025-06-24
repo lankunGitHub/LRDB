@@ -100,12 +100,6 @@ inline bool IsCompatible(const Comparator* a, const Comparator* b) {
     return std::string(a->Name()) == std::string(b->Name());
 }
 
-// 获取比较器的简短名称（去掉前缀）
-std::string GetShortName(const Comparator* comparator);
-
-// 从名称创建标准比较器
-const Comparator* GetByName(const std::string& name);
-
 } // namespace comparator_util
 
 } // namespace lrdb

@@ -16,68 +16,81 @@ DefaultErrorHandler::DefaultErrorHandler(size_t max_reports)
 void DefaultErrorHandler::HandleError(const Status &status, ErrorType type,
                                       ErrorSeverity severity,
                                       const ErrorContext &context) {
-  if (severity < severity_threshold_) {
+  // 原子读取，避免与 SetSeverityThreshold 的并发写构成数据竞争
+  if (severity < severity_threshold_.load(std::memory_order_acquire)) {
     return;
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  // 错误回调必须等 mutex_ 释放后再调用：回调里可能再调
+  // ReportError/GetErrorReports/ClearErrorHistory 等接口，
+  // 持锁调用会对非递归 mutex 二次加锁自死锁。
+  // 因此这里在锁内只更新状态并拷贝出回调与报告副本
+  std::function<void(const ErrorReport &)> callback;
+  ErrorReport report_copy;
 
-  std::string signature = GenerateErrorSignature(status, type, context);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
 
-  auto it = error_signature_map_.find(signature);
-  if (it != error_signature_map_.end()) {
-    // 更新现有错误报告
-    size_t index = it->second;
-    if (index < error_reports_.size()) {
-      ErrorReport &report = error_reports_[index];
-      report.occurrence_count++;
-      report.last_occurrence = context.timestamp;
+    std::string signature = GenerateErrorSignature(status, type, context);
+
+    auto it = error_signature_map_.find(signature);
+    if (it != error_signature_map_.end()) {
+      // 更新现有错误报告
+      size_t index = it->second;
+      if (index < error_reports_.size()) {
+        ErrorReport &report = error_reports_[index];
+        report.occurrence_count++;
+        report.last_occurrence = context.timestamp;
+
+        // 记录日志
+        LOG_WARN << "Recurring error [" << signature << "] occurred "
+                 << report.occurrence_count << " times: " << status.ToString();
+      }
+    } else {
+      // 创建新的错误报告
+      ErrorReport report(status, type, severity, context);
+
+      if (error_reports_.size() >= max_reports_) {
+        CleanupOldReports();
+      }
+
+      size_t index = error_reports_.size();
+      error_reports_.emplace_back(std::move(report));
+      error_signature_map_[signature] = index;
 
       // 记录日志
-      LOG_WARN << "Recurring error [" << signature << "] occurred "
-               << report.occurrence_count << " times: " << status.ToString();
+      LogLevel log_level;
+      switch (severity) {
+      case ErrorSeverity::Critical:
+        log_level = LogLevel::kFatal;
+        break;
+      case ErrorSeverity::High:
+        log_level = LogLevel::kError;
+        break;
+      case ErrorSeverity::Medium:
+        log_level = LogLevel::kWarn;
+        break;
+      default:
+        log_level = LogLevel::kDebug;
+        break;
+      }
+
+      LogManager::Instance().Write(log_level, __FILE__, __LINE__,
+                                   "Error in " + context.component +
+                                       "::" + context.operation + " - " +
+                                       status.ToString() +
+                                       (!context.additional_info.empty()
+                                            ? " (" + context.additional_info + ")"
+                                            : ""));
+
+      // 拷贝回调与报告，锁外调用
+      callback = error_callback_;
+      report_copy = error_reports_.back();
     }
-  } else {
-    // 创建新的错误报告
-    ErrorReport report(status, type, severity, context);
+  }
 
-    if (error_reports_.size() >= max_reports_) {
-      CleanupOldReports();
-    }
-
-    size_t index = error_reports_.size();
-    error_reports_.emplace_back(std::move(report));
-    error_signature_map_[signature] = index;
-
-    // 记录日志
-    LogLevel log_level;
-    switch (severity) {
-    case ErrorSeverity::Critical:
-      log_level = LogLevel::kFatal;
-      break;
-    case ErrorSeverity::High:
-      log_level = LogLevel::kError;
-      break;
-    case ErrorSeverity::Medium:
-      log_level = LogLevel::kWarn;
-      break;
-    default:
-      log_level = LogLevel::kDebug;
-      break;
-    }
-
-    LogManager::Instance().Write(log_level, __FILE__, __LINE__,
-                                 "Error in " + context.component +
-                                     "::" + context.operation + " - " +
-                                     status.ToString() +
-                                     (!context.additional_info.empty()
-                                          ? " (" + context.additional_info + ")"
-                                          : ""));
-
-    // 触发错误回调
-    if (error_callback_) {
-      error_callback_(error_reports_.back());
-    }
+  if (callback) {
+    callback(report_copy);
   }
 }
 
@@ -99,7 +112,7 @@ void DefaultErrorHandler::SetErrorCallback(
 }
 
 void DefaultErrorHandler::SetSeverityThreshold(ErrorSeverity threshold) {
-  severity_threshold_ = threshold;
+  severity_threshold_.store(threshold, std::memory_order_release);
 }
 
 size_t DefaultErrorHandler::GetTotalErrorCount() const {
@@ -189,9 +202,15 @@ ErrorHandler *ErrorHandlerManager::GetHandler() const {
 void ErrorHandlerManager::ReportError(const Status &status, ErrorType type,
                                       ErrorSeverity severity,
                                       const ErrorContext &context) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (handler_) {
-    handler_->HandleError(status, type, severity, context);
+  // 锁内只取指针，锁外调用：HandleError 可能触发用户回调，
+  // 跨用户代码持锁容易自死锁
+  ErrorHandler* handler = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    handler = handler_.get();
+  }
+  if (handler) {
+    handler->HandleError(status, type, severity, context);
   }
 }
 
@@ -201,6 +220,7 @@ ErrorType ErrorUtils::InferErrorType(const Status &status) {
   case StatusCode::kOk:
     return ErrorType::SystemError; // 不应该发生
   case StatusCode::kNotFound:
+  case StatusCode::kDeleted:
     return ErrorType::NotFoundError;
   case StatusCode::kCorruption:
     return ErrorType::CorruptionError;
@@ -314,12 +334,23 @@ void ErrorRecoveryManager::RegisterCleanupCallback(
   LOG_DEBUG << "Registered cleanup callback for component: " << component_name;
 }
 
+void ErrorRecoveryManager::UnregisterCleanupCallback(
+    const std::string &component_name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  cleanup_callbacks_.erase(component_name);
+}
+
 void ErrorRecoveryManager::RegisterRecoveryCallback(
     ErrorType error_type, ErrorRecoveryCallback callback) {
   std::lock_guard<std::mutex> lock(mutex_);
   recovery_callbacks_[error_type] = callback;
   LOG_DEBUG << "Registered recovery callback for error type: "
             << ErrorUtils::ErrorTypeToString(error_type);
+}
+
+void ErrorRecoveryManager::UnregisterRecoveryCallback(ErrorType error_type) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  recovery_callbacks_.erase(error_type);
 }
 
 void ErrorRecoveryManager::RegisterGlobalRecoveryCallback(

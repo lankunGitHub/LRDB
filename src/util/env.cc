@@ -133,7 +133,12 @@ public:
         }
         
         file.seekg(0, std::ios::end);
-        size_t size = file.tellg();
+        std::streampos end_pos = file.tellg();
+        if (end_pos < 0) {
+            // tellg 失败返回 -1，赋给 size_t 会变成 SIZE_MAX 导致 bad_alloc
+            return Status::IOError("Failed to determine file size");
+        }
+        size_t size = static_cast<size_t>(end_pos);
         file.seekg(0, std::ios::beg);
         
         data->resize(size);
@@ -256,8 +261,9 @@ public:
         if (fcntl(posix_lock->fd_, F_SETLK, &fl) == -1) {
             return Status::IOError("Cannot unlock file", strerror(errno));
         }
-        
+
         close(posix_lock->fd_);
+        posix_lock->fd_ = -1; // 析构时不再二次 close
         lock.reset();
         return Status::OK();
     }
@@ -307,7 +313,7 @@ public:
             return 0;
         }
         
-        long rss_pages;
+        long rss_pages = 0;
         statm >> rss_pages >> rss_pages; // 跳过第一个字段，读取RSS
         
         long page_size = sysconf(_SC_PAGE_SIZE);
@@ -416,11 +422,21 @@ private:
         }
         
         Status Read(size_t n, Slice* result, char* scratch) override {
-            ssize_t bytes_read = read(fd_, scratch, n);
-            if (bytes_read < 0) {
-                return Status::IOError("Cannot read file", strerror(errno));
+            // 循环读满 n 字节（EOF 时返回已读部分）：
+            // 单次 read 的短读会被上层误判为文件损坏，掩盖真实 I/O 故障
+            size_t total = 0;
+            while (total < n) {
+                ssize_t bytes_read = read(fd_, scratch + total, n - total);
+                if (bytes_read < 0) {
+                    if (errno == EINTR) continue;
+                    return Status::IOError("Cannot read file", strerror(errno));
+                }
+                if (bytes_read == 0) {
+                    break; // EOF
+                }
+                total += static_cast<size_t>(bytes_read);
             }
-            *result = Slice(scratch, bytes_read);
+            *result = Slice(scratch, total);
             return Status::OK();
         }
         
@@ -452,11 +468,21 @@ private:
         }
         
         Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const override {
-            ssize_t bytes_read = pread(fd_, scratch, n, offset);
-            if (bytes_read < 0) {
-                return Status::IOError("Cannot read file", strerror(errno));
+            // 同 SequentialFile::Read：循环读满 n 字节，短读只在 EOF 时发生
+            size_t total = 0;
+            while (total < n) {
+                ssize_t bytes_read =
+                    pread(fd_, scratch + total, n - total, offset + total);
+                if (bytes_read < 0) {
+                    if (errno == EINTR) continue;
+                    return Status::IOError("Cannot read file", strerror(errno));
+                }
+                if (bytes_read == 0) {
+                    break; // EOF
+                }
+                total += static_cast<size_t>(bytes_read);
             }
-            *result = Slice(scratch, bytes_read);
+            *result = Slice(scratch, total);
             return Status::OK();
         }
         
@@ -553,7 +579,16 @@ private:
     public:
         PosixFileLock(int fd, const std::string& filename)
             : fd_(fd), filename_(filename) {}
-        
+
+        ~PosixFileLock() override {
+            // 没有走 UnlockFile 的路径（异常/忘记调用/上层 reset）也必须
+            // 关闭 fd，否则泄漏文件描述符并持有锁到进程退出
+            if (fd_ >= 0) {
+                ::close(fd_);
+                fd_ = -1;
+            }
+        }
+
         int fd_;
         std::string filename_;
     };
@@ -594,10 +629,19 @@ private:
         void Logv(const char* format, va_list args) override {
             auto now = std::chrono::system_clock::now();
             auto time_t = std::chrono::system_clock::to_time_t(now);
-            
+
             char time_buffer[64];
-            strftime(time_buffer, sizeof(time_buffer), "%Y-%m-%d %H:%M:%S", localtime(&time_t));
-            
+            // localtime 返回进程级静态 struct tm，多线程调用是数据竞争；
+            // 用 localtime_r 写线程局部变量
+            struct tm tm_buf;
+            if (localtime_r(&time_t, &tm_buf) != nullptr) {
+                strftime(time_buffer, sizeof(time_buffer),
+                         "%Y-%m-%d %H:%M:%S", &tm_buf);
+            } else {
+                time_buffer[0] = '?';
+                time_buffer[1] = '\0';
+            }
+
             std::lock_guard<std::mutex> lock(mutex_);
             fprintf(fp_, "[%s] ", time_buffer);
             vfprintf(fp_, format, args);

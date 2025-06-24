@@ -77,8 +77,8 @@ uint32_t Hash32(const char* data, size_t length, uint32_t seed) {
     
     // 处理剩余字节
     switch (length) {
-        case 3: h ^= static_cast<uint32_t>(data[2]) << 16;
-        case 2: h ^= static_cast<uint32_t>(data[1]) << 8;
+        case 3: h ^= static_cast<uint32_t>(data[2]) << 16; [[fallthrough]];
+        case 2: h ^= static_cast<uint32_t>(data[1]) << 8; [[fallthrough]];
         case 1: h ^= static_cast<uint32_t>(data[0]);
                 h *= m;
     }
@@ -118,12 +118,12 @@ uint64_t Hash64(const char* data, size_t length, uint64_t seed) {
     
     // 处理剩余字节
     switch (length) {
-        case 7: h ^= static_cast<uint64_t>(data[6]) << 48;
-        case 6: h ^= static_cast<uint64_t>(data[5]) << 40;
-        case 5: h ^= static_cast<uint64_t>(data[4]) << 32;
-        case 4: h ^= static_cast<uint64_t>(data[3]) << 24;
-        case 3: h ^= static_cast<uint64_t>(data[2]) << 16;
-        case 2: h ^= static_cast<uint64_t>(data[1]) << 8;
+        case 7: h ^= static_cast<uint64_t>(data[6]) << 48; [[fallthrough]];
+        case 6: h ^= static_cast<uint64_t>(data[5]) << 40; [[fallthrough]];
+        case 5: h ^= static_cast<uint64_t>(data[4]) << 32; [[fallthrough]];
+        case 4: h ^= static_cast<uint64_t>(data[3]) << 24; [[fallthrough]];
+        case 3: h ^= static_cast<uint64_t>(data[2]) << 16; [[fallthrough]];
+        case 2: h ^= static_cast<uint64_t>(data[1]) << 8; [[fallthrough]];
         case 1: h ^= static_cast<uint64_t>(data[0]);
                 h *= m;
     }
@@ -184,8 +184,8 @@ uint32_t MurmurHash3_x86_32(const void* key, int len, uint32_t seed) {
     uint32_t k1 = 0;
     
     switch (len & 3) {
-        case 3: k1 ^= tail[2] << 16;
-        case 2: k1 ^= tail[1] << 8;
+        case 3: k1 ^= tail[2] << 16; [[fallthrough]];
+        case 2: k1 ^= tail[1] << 8; [[fallthrough]];
         case 1: k1 ^= tail[0];
                 k1 *= c1;
                 k1 = (k1 << 15) | (k1 >> 17); // rotl32(k1, 15)
@@ -247,25 +247,25 @@ void MurmurHash3_x64_128(const void* key, const int len, const uint32_t seed, vo
     uint64_t k2 = 0;
     
     switch (len & 15) {
-        case 15: k2 ^= static_cast<uint64_t>(tail[14]) << 48;
-        case 14: k2 ^= static_cast<uint64_t>(tail[13]) << 40;
-        case 13: k2 ^= static_cast<uint64_t>(tail[12]) << 32;
-        case 12: k2 ^= static_cast<uint64_t>(tail[11]) << 24;
-        case 11: k2 ^= static_cast<uint64_t>(tail[10]) << 16;
-        case 10: k2 ^= static_cast<uint64_t>(tail[9]) << 8;
+        case 15: k2 ^= static_cast<uint64_t>(tail[14]) << 48; [[fallthrough]];
+        case 14: k2 ^= static_cast<uint64_t>(tail[13]) << 40; [[fallthrough]];
+        case 13: k2 ^= static_cast<uint64_t>(tail[12]) << 32; [[fallthrough]];
+        case 12: k2 ^= static_cast<uint64_t>(tail[11]) << 24; [[fallthrough]];
+        case 11: k2 ^= static_cast<uint64_t>(tail[10]) << 16; [[fallthrough]];
+        case 10: k2 ^= static_cast<uint64_t>(tail[9]) << 8; [[fallthrough]];
         case 9:  k2 ^= static_cast<uint64_t>(tail[8]) << 0;
                  k2 *= c2;
                  k2 = (k2 << 33) | (k2 >> 31); // rotl64(k2, 33)
                  k2 *= c1;
                  h2 ^= k2;
-                 
-        case 8:  k1 ^= static_cast<uint64_t>(tail[7]) << 56;
-        case 7:  k1 ^= static_cast<uint64_t>(tail[6]) << 48;
-        case 6:  k1 ^= static_cast<uint64_t>(tail[5]) << 40;
-        case 5:  k1 ^= static_cast<uint64_t>(tail[4]) << 32;
-        case 4:  k1 ^= static_cast<uint64_t>(tail[3]) << 24;
-        case 3:  k1 ^= static_cast<uint64_t>(tail[2]) << 16;
-        case 2:  k1 ^= static_cast<uint64_t>(tail[1]) << 8;
+                 [[fallthrough]];
+        case 8:  k1 ^= static_cast<uint64_t>(tail[7]) << 56; [[fallthrough]];
+        case 7:  k1 ^= static_cast<uint64_t>(tail[6]) << 48; [[fallthrough]];
+        case 6:  k1 ^= static_cast<uint64_t>(tail[5]) << 40; [[fallthrough]];
+        case 5:  k1 ^= static_cast<uint64_t>(tail[4]) << 32; [[fallthrough]];
+        case 4:  k1 ^= static_cast<uint64_t>(tail[3]) << 24; [[fallthrough]];
+        case 3:  k1 ^= static_cast<uint64_t>(tail[2]) << 16; [[fallthrough]];
+        case 2:  k1 ^= static_cast<uint64_t>(tail[1]) << 8; [[fallthrough]];
         case 1:  k1 ^= static_cast<uint64_t>(tail[0]) << 0;
                  k1 *= c1;
                  k1 = (k1 << 31) | (k1 >> 33); // rotl64(k1, 31)

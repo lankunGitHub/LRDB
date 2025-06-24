@@ -110,7 +110,9 @@ bool GetVarint32(Slice* input, uint32_t* value) {
     const char* limit = p + input->size();
     const char* q = p;
     uint64_t result = 0;
-    for (uint32_t shift = 0; shift <= 63 && q < limit; shift += 7) {
+    // varint32 最多 5 字节；shift 超过 28 说明是非法超长编码，
+    // 继续按 64 位移位累积没有任何意义（旧实现缺少该保护）
+    for (uint32_t shift = 0; shift <= 28 && q < limit; shift += 7) {
         uint64_t byte = static_cast<uint64_t>(*q);
         q++;
         if (byte & 0x80) {

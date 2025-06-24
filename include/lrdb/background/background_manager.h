@@ -163,6 +163,16 @@ private:
     std::vector<std::thread> worker_threads_;
     std::atomic<int> worker_thread_count_;
     std::atomic<int> busy_thread_count_;
+
+    // 延迟重排线程（周期任务的下一次调度）。
+    // 不用 detach：Shutdown 必须 join 它们，否则它们在 sleep 醒来后
+    // 可能访问已析构的 this（use-after-free）
+    struct DelayThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> done;
+    };
+    std::mutex delay_threads_mu_;
+    std::vector<DelayThread> delay_threads_;
     
     // 同步原语
     mutable std::mutex queue_mutex_;

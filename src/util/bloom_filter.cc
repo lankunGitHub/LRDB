@@ -46,6 +46,10 @@ StandardBloomFilter::StandardBloomFilter(size_t bit_array_size,
 StandardBloomFilter::~StandardBloomFilter() = default;
 
 void StandardBloomFilter::Add(const Slice &key) {
+  // 未初始化/反序列化到 0 位的过滤器，取模会除零
+  if (bit_array_size_ == 0) {
+    return;
+  }
   auto hashes = ComputeHashes(key);
 
   for (uint32_t hash : hashes) {
@@ -57,6 +61,10 @@ void StandardBloomFilter::Add(const Slice &key) {
 }
 
 bool StandardBloomFilter::MayContain(const Slice &key) const {
+  // 0 位过滤器：保守地认为"可能存在"，交给实际查询判定
+  if (bit_array_size_ == 0) {
+    return true;
+  }
   auto hashes = ComputeHashes(key);
 
   for (uint32_t hash : hashes) {
@@ -165,7 +173,8 @@ StandardBloomFilter::ComputeHashes(const Slice &key) const {
 
   // 使用不同的种子生成基础哈希值
   const uint32_t seed1 = 0xbc9f1d34;
-  const uint32_t seed2 = 0xdeadbeef;
+  // seed2 保留用于双哈希扩展（当前单哈希实现未使用）
+  // const uint32_t seed2 = 0xdeadbeef;
 
   uint32_t h1 = hash_util::MurmurHash3_x86_32(
       key.data(), static_cast<int>(key.size()), seed1);
@@ -460,7 +469,8 @@ std::vector<uint32_t> BloomFilterReader::ComputeHashes(const Slice &key) const {
 
   // 使用不同的种子生成基础哈希值
   const uint32_t seed1 = 0xbc9f1d34;
-  const uint32_t seed2 = 0xdeadbeef;
+  // seed2 保留用于双哈希扩展（当前单哈希实现未使用）
+  // const uint32_t seed2 = 0xdeadbeef;
 
   uint32_t h1 = hash_util::MurmurHash3_x86_32(
       key.data(), static_cast<int>(key.size()), seed1);
