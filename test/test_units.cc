@@ -11,6 +11,7 @@
 #include "lrdb/util/hash.h"
 #include "lrdb/util/skiplist.h"
 #include "lrdb/wal/wal.h"
+#include "lrdb/concurrency/lock_manager.h"
 #include "test_util.h"
 
 #include <cstring>
@@ -343,6 +344,95 @@ TEST(WALCompressionRoundTrip) {
 
     std::filesystem::remove(file);
     std::filesystem::remove(compressed);
+}
+
+
+// ============================================================================
+// 回归测试：修复过的缺陷
+// ============================================================================
+
+// Slice::find 在 needle 比剩余部分长时不能无符号下溢（旧实现越界读）
+TEST(SliceFindLongNeedle) {
+    lrdb::Slice s("ab");
+    lrdb::Slice needle("abcdefg");
+    TEST_EXPECT(s.find(needle) == std::string::npos,
+                "long needle should return npos");
+    TEST_EXPECT(s.find(needle, 1) == std::string::npos,
+                "long needle with start should return npos");
+    TEST_EXPECT(lrdb::Slice("hello").find(lrdb::Slice("ell")) == 1,
+                "normal find works");
+}
+
+// LockManager：X 与 X 互斥（旧实现 Compatible(X,X) 返回 true，
+// 两个事务能同时持有同一键的排他锁）
+TEST(LockManagerXXExclusion) {
+    lrdb::LockManager lm;
+    auto zero_ms = std::chrono::milliseconds(0);
+    lrdb::Status s1 = lm.Acquire("k", 1, lrdb::LockType::kExclusiveLock, zero_ms);
+    TEST_EXPECT(s1.ok(), "first X lock acquired");
+    // 第二个事务拿 X 必须立即失败（非阻塞尝试）
+    lrdb::Status s2 = lm.TryAcquire("k", 2, lrdb::LockType::kExclusiveLock);
+    TEST_EXPECT(!s2.ok(), "second X lock must be rejected");
+    // 共享锁与 X 也不兼容
+    lrdb::Status s3 = lm.TryAcquire("k", 3, lrdb::LockType::kSharedLock);
+    TEST_EXPECT(!s3.ok(), "S lock must conflict with held X");
+    lm.ReleaseAll(1);
+    lrdb::Status s4 = lm.TryAcquire("k", 2, lrdb::LockType::kExclusiveLock);
+    TEST_EXPECT(s4.ok(), "X lock acquirable after release");
+    lm.ReleaseAll(2);
+}
+
+// MemTable 墓碑用独立的 Deleted 状态表示，与"未命中"可区分
+TEST(MemTableTombstoneStatus) {
+    lrdb::MemTable mt(lrdb::BytewiseComparator());
+    lrdb::Status put = mt.Put(lrdb::Slice("k"), lrdb::Slice("v"), 10);
+    TEST_EXPECT(put.ok(), "put succeeds");
+    lrdb::Status del = mt.Delete(lrdb::Slice("k"), 11);
+    TEST_EXPECT(del.ok(), "delete succeeds");
+
+    std::string value;
+    lrdb::Status status;
+    bool found = mt.Get(lrdb::Slice("k"), &value, &status, 0);
+    TEST_EXPECT(!found, "tombstone means not found");
+    TEST_EXPECT(status.IsDeleted(), "tombstone must be Deleted status");
+    // 快照早于删除时还能看到旧值
+    found = mt.Get(lrdb::Slice("k"), &value, &status, 10);
+    TEST_EXPECT(found && value == "v", "snapshot before delete sees old value");
+    // 未命中的键是 NotFound 而不是 Deleted
+    found = mt.Get(lrdb::Slice("absent"), &value, &status, 0);
+    TEST_EXPECT(!found && status.IsNotFound(),
+                "missing key is NotFound, not Deleted");
+}
+
+// WALRecord::Decode 对损坏记录必须安全返回 Corruption（旧实现 uint32 回绕越界读）
+TEST(WALRecordDecodeCorrupt) {
+    lrdb::WALRecord record;
+    // 键长/值长字段为极大值时长度校验不能回绕通过
+    std::string evil(33, '\0');
+    evil[0] = static_cast<char>(lrdb::WALRecordType::kPut);
+    // 头部偏移 21/25 处是 key_len / value_len（Fixed32），
+    // 用小字符串作为 dst 再拷回
+    std::string kl, vl;
+    lrdb::coding::PutFixed32(&kl, 0xFFFFFFFFu);
+    lrdb::coding::PutFixed32(&vl, 0xFFFFFFFFu);
+    for (size_t i = 0; i < 4; ++i) {
+        evil[21 + i] = kl[i];
+        evil[25 + i] = vl[i];
+    }
+    lrdb::WALRecord decoded;
+    lrdb::Status s = decoded.Decode(lrdb::Slice(evil));
+    TEST_EXPECT(!s.ok(), "corrupt lengths must be rejected");
+    // 尾部截断也必须报 Corruption
+    lrdb::WALRecord ok_record;
+    ok_record.type = lrdb::WALRecordType::kPut;
+    ok_record.sequence_number = 1;
+    ok_record.column_family_id = 0;
+    ok_record.key = "x";
+    ok_record.value = "y";
+    std::string truncated = ok_record.Encode();
+    truncated.resize(truncated.size() - 2);
+    TEST_EXPECT(!decoded.Decode(lrdb::Slice(truncated)).ok(),
+                "truncated record must be rejected");
 }
 
 int main() {
